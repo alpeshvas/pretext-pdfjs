@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>pretext-pdf — Pretext-powered text layer for PDF.js</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ink: #1a1a1a;
+  --paper: #f6f3ee;
+  --cream: #ece7df;
+  --dim: #8a8578;
+  --accent: #c44b2b;
+  --accent2: #2b6e4f;
+  --code-bg: #2c2620;
+  --code-fg: #e8dfd4;
+  --serif: 'Newsreader', 'Georgia', serif;
+  --mono: 'JetBrains Mono', monospace;
+  --measure: 680px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { font-size: 18px; scroll-behavior: smooth; }
+
+body {
+  font-family: var(--serif);
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: #c44b2b30; }
+
+/* ── Hero ── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 2rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 20% 50%, #c44b2b08, transparent 50%),
+    radial-gradient(ellipse at 80% 30%, #2b6e4f06, transparent 50%);
+  pointer-events: none;
+}
+
+.hero-badge {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 0.3em 1em;
+  border-radius: 2px;
+  margin-bottom: 2rem;
+  animation: fadeUp 0.8s ease both;
+}
+
+.hero h1 {
+  font-size: clamp(2.8rem, 7vw, 5.5rem);
+  font-weight: 300;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  text-align: center;
+  max-width: 800px;
+  animation: fadeUp 0.8s ease 0.1s both;
+}
+
+.hero h1 em {
+  font-style: italic;
+  font-weight: 400;
+  color: var(--accent);
+}
+
+.hero-sub {
+  font-size: 1.15rem;
+  color: var(--dim);
+  margin-top: 1.5rem;
+  text-align: center;
+  max-width: 520px;
+  line-height: 1.6;
+  animation: fadeUp 0.8s ease 0.2s both;
+}
+
+.hero-links {
+  display: flex;
+  gap: 1rem;
+  margin-top: 2.5rem;
+  animation: fadeUp 0.8s ease 0.3s both;
+}
+
+.hero-links a {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+  padding: 0.7em 1.8em;
+  border-radius: 2px;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: var(--ink);
+  color: var(--paper);
+  border: 1px solid var(--ink);
+}
+.btn-primary:hover { background: var(--accent); border-color: var(--accent); }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid #bbb5a8;
+}
+.btn-ghost:hover { border-color: var(--ink); }
+
+.scroll-hint {
+  position: absolute;
+  bottom: 2rem;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  animation: fadeUp 0.8s ease 0.5s both, float 3s ease-in-out infinite 1.5s;
+}
+
+/* ── Sections ── */
+section {
+  padding: 6rem 2rem;
+  max-width: var(--measure);
+  margin: 0 auto;
+}
+
+.wide-section {
+  max-width: 1000px;
+}
+
+h2 {
+  font-size: 2.2rem;
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.5rem;
+}
+
+h2 em { font-weight: 400; color: var(--accent); }
+
+h3 {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 1.5rem;
+}
+
+p {
+  line-height: 1.7;
+  margin-bottom: 1.2rem;
+  color: #3a3a38;
+}
+
+.divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #c4bdb2, transparent);
+  margin: 0 auto;
+  max-width: var(--measure);
+}
+
+/* ── Architecture ── */
+.arch-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: #c4bdb2;
+  border: 1px solid #c4bdb2;
+  margin: 2rem 0;
+}
+
+.arch-cell {
+  background: var(--paper);
+  padding: 1.5rem;
+}
+
+.arch-cell.replaced {
+  background: #c44b2b08;
+}
+
+.arch-label {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 0.3rem;
+}
+
+.arch-name {
+  font-size: 1rem;
+  font-weight: 500;
+}
+
+.arch-cell.replaced .arch-label { color: var(--accent); }
+.arch-cell.replaced .arch-name { color: var(--accent); }
+
+.tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.55rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.2em 0.6em;
+  border-radius: 2px;
+  margin-top: 0.5rem;
+}
+
+.tag-kept { background: #e8e3db; color: var(--dim); }
+.tag-new { background: #c44b2b18; color: var(--accent); }
+
+/* ── Demo panels ── */
+.demo-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2rem;
+  margin: 2rem 0;
+}
+
+@media (min-width: 700px) {
+  .demo-grid { grid-template-columns: 1fr 1fr; }
+  .demo-grid .demo-full { grid-column: 1 / -1; }
+}
+
+.demo-card {
+  border: 1px solid #c4bdb2;
+  border-radius: 3px;
+  overflow: hidden;
+  background: white;
+  transition: box-shadow 0.3s;
+}
+.demo-card:hover { box-shadow: 0 8px 32px #1a1a1a10; }
+
+.demo-header {
+  padding: 1.2rem 1.5rem;
+  border-bottom: 1px solid #ece7df;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.demo-title {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.demo-badge {
+  font-family: var(--mono);
+  font-size: 0.55rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.2em 0.7em;
+  border-radius: 2px;
+}
+
+.demo-badge-pretext { background: #c44b2b15; color: var(--accent); }
+.demo-badge-pinch { background: #2b6e4f15; color: var(--accent2); }
+
+.demo-canvas-wrap {
+  position: relative;
+  height: 400px;
+  background: #0a0a0a;
+  cursor: grab;
+  overflow: hidden;
+  touch-action: none;
+}
+
+.demo-canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.demo-controls {
+  padding: 0.8rem 1.5rem;
+  border-top: 1px solid #ece7df;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.demo-btn {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  padding: 0.4em 1em;
+  border: 1px solid #c4bdb2;
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.demo-btn:hover { border-color: var(--ink); }
+.demo-btn.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
+.demo-stat {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  color: var(--dim);
+  margin-left: auto;
+}
+
+.demo-stat span { color: var(--accent); }
+
+/* ── Code ── */
+.code-block {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.7;
+  padding: 1.5rem 2rem;
+  border-radius: 3px;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+
+.code-block .kw { color: #e6956f; }
+.code-block .str { color: #a8c97a; }
+.code-block .cm { color: #7a7568; }
+.code-block .fn { color: #7ebfc4; }
+
+/* ── Footer ── */
+footer {
+  padding: 4rem 2rem;
+  text-align: center;
+  border-top: 1px solid #ddd8cf;
+}
+
+footer p {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--dim);
+  letter-spacing: 0.06em;
+}
+
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+/* ── Upload area ── */
+.upload-area {
+  border: 2px dashed #c4bdb2;
+  border-radius: 3px;
+  padding: 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin: 1.5rem 0;
+}
+.upload-area:hover { border-color: var(--accent); background: #c44b2b05; }
+.upload-area p { margin: 0; color: var(--dim); font-size: 0.85rem; }
+
+/* ── Animations ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+/* ── Responsive ── */
+@media (max-width: 600px) {
+  html { font-size: 16px; }
+  section { padding: 3rem 1.2rem; }
+  .arch-grid { grid-template-columns: 1fr; }
+  .demo-canvas-wrap { height: 320px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<div class="hero">
+  <div class="hero-badge">Pretext-powered text layer for PDF.js</div>
+  <h1>Pinch to zoom <em>text</em>,<br>not the page.</h1>
+  <p class="hero-sub">
+    A wrapper around PDF.js that replaces the text layer with
+    Pretext's zero-reflow measurement engine. 1,528 lines.
+  </p>
+  <div class="hero-links">
+    <a href="#demos" class="btn-primary">SEE DEMOS</a>
+    <a href="#install" class="btn-ghost">INSTALL</a>
+  </div>
+  <div class="scroll-hint">↓ scroll</div>
+</div>
+
+<div class="divider"></div>
+
+<!-- Architecture -->
+<section>
+  <h3>Architecture</h3>
+  <h2>Use PDF.js for parsing.<br>Use Pretext for <em>text</em>.</h2>
+  <p>
+    PDF.js has no plugin system. But its layered API means you can use the
+    parser and canvas renderer while bringing your own text layer. That's
+    exactly what pretext-pdf does — a 1,528-line wrapper, not a 128K-line fork.
+  </p>
+
+  <div class="arch-grid">
+    <div class="arch-cell">
+      <div class="arch-label">Core Parser</div>
+      <div class="arch-name">pdfjs-dist</div>
+      <div class="tag tag-kept">unchanged</div>
+    </div>
+    <div class="arch-cell">
+      <div class="arch-label">Canvas Renderer</div>
+      <div class="arch-name">pdfjs-dist</div>
+      <div class="tag tag-kept">unchanged</div>
+    </div>
+    <div class="arch-cell replaced">
+      <div class="arch-label">Text Layer</div>
+      <div class="arch-name">PretextTextLayer</div>
+      <div class="tag tag-new">@chenglou/pretext</div>
+    </div>
+    <div class="arch-cell replaced">
+      <div class="arch-label">Reading Modes</div>
+      <div class="arch-name">Pinch / Morph / Combined</div>
+      <div class="tag tag-new">pinch-type</div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- Demos -->
+<section class="wide-section" id="demos">
+  <h3>Interactive demos</h3>
+  <h2>Three ways to read a <em>PDF</em>.</h2>
+  <p>
+    Drop your own PDF below, or use the sample text. Pinch (or ctrl+scroll)
+    to zoom text. All rendering uses Pretext's Canvas measurement — zero DOM reflows.
+  </p>
+
+  <div class="upload-area" id="uploadArea">
+    <p>Drop a PDF here or click to upload</p>
+    <input type="file" accept=".pdf" id="fileInput" style="display:none">
+  </div>
+
+  <div class="demo-grid">
+
+    <!-- Demo 1: Pinch Type -->
+    <div class="demo-card">
+      <div class="demo-header">
+        <div class="demo-title">Pinch Type</div>
+        <div class="demo-badge demo-badge-pinch">pinch-to-zoom</div>
+      </div>
+      <div class="demo-canvas-wrap" id="demo-pinch"></div>
+      <div class="demo-controls">
+        <button class="demo-btn active" onclick="setDemoFont('pinch', -1)">−</button>
+        <span class="demo-stat" id="pinch-size">18px</span>
+        <button class="demo-btn active" onclick="setDemoFont('pinch', 1)">+</button>
+        <span class="demo-stat" style="margin-left:auto">ctrl+scroll to zoom</span>
+      </div>
+    </div>
+
+    <!-- Demo 2: Scroll Morph -->
+    <div class="demo-card">
+      <div class="demo-header">
+        <div class="demo-title">Scroll Morph</div>
+        <div class="demo-badge demo-badge-pretext">fisheye</div>
+      </div>
+      <div class="demo-canvas-wrap" id="demo-morph"></div>
+      <div class="demo-controls">
+        <span class="demo-stat">center 26px → edge 11px</span>
+        <span class="demo-stat" style="margin-left:auto">scroll to see effect</span>
+      </div>
+    </div>
+
+    <!-- Demo 3: Combined -->
+    <div class="demo-card demo-full">
+      <div class="demo-header">
+        <div class="demo-title">Combined — Pinch + Morph</div>
+        <div class="demo-badge demo-badge-pinch">pinch + fisheye</div>
+      </div>
+      <div class="demo-canvas-wrap" id="demo-combined" style="height:480px"></div>
+      <div class="demo-controls">
+        <span class="demo-stat" id="combined-stat">center 26px · edge 11px</span>
+        <span class="demo-stat" style="margin-left:auto">pinch or ctrl+scroll to zoom text</span>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- Install -->
+<section id="install">
+  <h3>Get started</h3>
+  <h2>Two lines to <em>install</em>.</h2>
+
+  <div class="code-block">
+<span class="cm">// Install</span>
+npm install pretext-pdf
+
+<span class="cm">// Drop-in replacement for pdfjs-dist</span>
+<span class="kw">import</span> { getDocument, TextLayer } <span class="kw">from</span> <span class="str">"pretext-pdf"</span>;
+
+<span class="cm">// TextLayer is now Pretext-powered.</span>
+<span class="cm">// Same API. Zero DOM reflows.</span>
+  </div>
+
+  <div class="code-block">
+<span class="cm">// Pinch-to-zoom PDF reader</span>
+<span class="kw">import</span> { createPDFPinchReader } <span class="kw">from</span> <span class="str">"pretext-pdf/pinch"</span>;
+
+<span class="kw">const</span> reader = <span class="fn">createPDFPinchReader</span>(container, {
+  mode: <span class="str">"pinchMorph"</span>,
+});
+<span class="kw">await</span> reader.<span class="fn">open</span>(<span class="str">"document.pdf"</span>);
+<span class="kw">await</span> reader.<span class="fn">showPage</span>(1);
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<footer>
+  <p>
+    pretext-pdf · built on
+    <a href="https://github.com/chenglou/pretext">@chenglou/pretext</a> ·
+    <a href="https://github.com/lucascrespo23/pinch-type">pinch-type</a> ·
+    <a href="https://github.com/mozilla/pdf.js">pdf.js</a>
+  </p>
+</footer>
+
+<script type="module">
+// ── Load Pretext ──
+import { prepareWithSegments, layoutWithLines } from 'https://esm.sh/@chenglou/pretext@0.0.3';
+
+// ── Sample text (used when no PDF is uploaded) ──
+const SAMPLE_TEXT = `The browser has been lying to you about where text goes. For thirty years, every website has relied on the DOM to measure text — inserting elements, triggering layout reflow, reading dimensions, then throwing them away. A single forced reflow can block the main thread for 10-100ms on mobile devices.
+
+Pretext changes this. By measuring text segments once via Canvas and caching the results, it eliminates DOM reflows entirely from the text layout hot path. The prepare() function segments text using Intl.Segmenter, measures each word via canvas measureText(), and caches the widths. The layout() function then walks cached widths with pure arithmetic — no DOM reads, no canvas calls, no string allocations.
+
+The result: 300-600x faster text measurement. Hundreds of thousands of text boxes at 120fps. Magazine layouts and chat bubbles that actually wrap right. Text that reflows around a dragon at 60 frames per second.
+
+pretext-pdf brings this to PDF viewing. Instead of PDF.js creating DOM spans and measuring each one with getBoundingClientRect, we use Pretext's cached Canvas measurements. The text layer renders identically — same positions, same selection, same search — but without the reflow tax.
+
+And because Pretext gives us accurate text measurement without the DOM, we can do things PDF.js never could: pinch-to-zoom that resizes text instead of the page. Fisheye scroll effects where center text is large and bright while edges fade. Responsive reflow of PDF text into any container width. The fixed-layout constraint of PDF is finally optional.
+
+This demo renders text using Pretext's prepareWithSegments() and layoutWithLines() — the same functions that power the 500x speedup. Try pinching or ctrl+scrolling to resize the text in real time. Every frame, Pretext re-wraps all visible text with pure arithmetic over cached segment widths. No DOM. No reflow. Just math.`;
+
+// ── Shared engine ──
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+function createTextEngine(container, opts) {
+  const mode = opts.mode || 'pinchType';
+  const minFont = opts.minFontSize ?? 8;
+  const maxFont = opts.maxFontSize ?? 60;
+  const fontFamily = opts.fontFamily ?? '"Newsreader", Georgia, serif';
+  const lhRatio = opts.lineHeight ?? 1.6;
+  const padding = opts.padding ?? 24;
+  const bg = opts.background ?? '#0a0a0a';
+  const friction = opts.friction ?? 0.95;
+  const morphRadius = opts.morphRadius ?? 250;
+  const onZoom = opts.onZoom;
+
+  let fontSize = opts.fontSize ?? 18;
+  let centerSize = opts.centerFontSize ?? 26;
+  let edgeSize = opts.edgeFontSize ?? 11;
+  const initialRatio = edgeSize / centerSize;
+
+  const canvas = document.createElement('canvas');
+  canvas.style.cssText = 'display:block;width:100%;height:100%;touch-action:none';
+  container.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+
+  let dpr = Math.min(devicePixelRatio || 1, 3);
+  let W = 0, H = 0;
+  let rawText = '';
+  let lines = [];
+  let totalHeight = 0, maxScroll = 0;
+  let scrollY = 0, scrollVelocity = 0;
+  let touchLastY = 0, touchLastTime = 0, isTouching = false;
+  let pinchActive = false, pinchStartDist = 0;
+  let pinchStartSize = 0, pinchStartCenter = 0, pinchStartEdge = 0;
+  let raf = 0, destroyed = false;
+
+  function layout() {
+    if (!rawText || W === 0) return;
+    const maxW = W - padding * 2;
+    const fs = mode === 'pinchType' ? fontSize : centerSize;
+    const lh = fs * lhRatio;
+    const font = `400 ${fs}px ${fontFamily}`;
+    const paragraphs = rawText.split('\n\n');
+    lines = [];
+    let curY = padding + 10;
+    for (const para of paragraphs) {
+      const trimmed = para.trim();
+      if (!trimmed) continue;
+      ctx.font = font;
+      const prepared = prepareWithSegments(trimmed, font);
+      const result = layoutWithLines(prepared, maxW, lh);
+      for (let li = 0; li < result.lines.length; li++) {
+        lines.push({ text: result.lines[li].text, y: curY + li * lh, baseSize: fs });
+      }
+      curY += result.lines.length * lh + lh * 0.55;
+    }
+    totalHeight = curY + padding;
+    maxScroll = Math.max(0, totalHeight - H);
+    scrollY = clamp(scrollY, 0, maxScroll);
+  }
+
+  function render() {
+    const d = dpr;
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W * d, H * d);
+    ctx.textBaseline = 'top';
+
+    if (mode === 'pinchType') {
+      ctx.fillStyle = '#dcd5c8';
+      ctx.font = `400 ${fontSize * d}px ${fontFamily}`;
+      for (const line of lines) {
+        const sy = line.y - scrollY;
+        if (sy < -80 || sy > H + 80) continue;
+        ctx.fillText(line.text, padding * d, sy * d);
+      }
+    } else {
+      const vc = H / 2;
+      for (const line of lines) {
+        const sy = line.y - scrollY;
+        if (sy < -80 || sy > H + 80) continue;
+        const dist = Math.abs(sy - vc);
+        const t = Math.min(dist / morphRadius, 1);
+        const ease = 1 - (1 - t) ** 3;
+        const fs = centerSize + (edgeSize - centerSize) * ease;
+        const opacity = 1.0 + (0.2 - 1.0) * ease;
+        const c = Math.round(220 - (220 - 80) * ease);
+        ctx.save();
+        ctx.globalAlpha = opacity;
+        ctx.fillStyle = `rgb(${c},${c-5},${c-15})`;
+        ctx.font = `400 ${fs * d}px ${fontFamily}`;
+        const yOff = (fs - line.baseSize) * 0.5;
+        ctx.fillText(line.text, padding * d, (sy - yOff) * d);
+        ctx.restore();
+      }
+    }
+  }
+
+  function loop() {
+    if (destroyed) return;
+    if (!isTouching) {
+      scrollY += scrollVelocity;
+      scrollVelocity *= friction;
+      if (scrollY < 0) { scrollY *= 0.85; scrollVelocity *= 0.5; }
+      else if (scrollY > maxScroll) {
+        scrollY = maxScroll + (scrollY - maxScroll) * 0.85;
+        scrollVelocity *= 0.5;
+      }
+      if (Math.abs(scrollVelocity) < 0.1) scrollVelocity = 0;
+    }
+    render();
+    raf = requestAnimationFrame(loop);
+  }
+
+  function pDist(e) {
+    return Math.hypot(
+      e.touches[0].clientX - e.touches[1].clientX,
+      e.touches[0].clientY - e.touches[1].clientY
+    );
+  }
+
+  function onTouchStart(e) {
+    if (e.touches.length === 2 && mode !== 'scrollMorph') {
+      pinchActive = true; pinchStartDist = pDist(e);
+      pinchStartSize = fontSize; pinchStartCenter = centerSize; pinchStartEdge = edgeSize;
+      scrollVelocity = 0; isTouching = false;
+    } else if (e.touches.length === 1 && !pinchActive) {
+      isTouching = true; scrollVelocity = 0;
+      touchLastY = e.touches[0].clientY; touchLastTime = performance.now();
+    }
+    e.preventDefault();
+  }
+
+  function onTouchMove(e) {
+    if (pinchActive && e.touches.length === 2 && mode !== 'scrollMorph') {
+      const scale = pDist(e) / pinchStartDist;
+      if (mode === 'pinchType') {
+        const ns = clamp(Math.round(pinchStartSize * scale), minFont, maxFont);
+        if (ns !== fontSize) { fontSize = ns; layout(); onZoom?.(fontSize); }
+      } else {
+        const nc = clamp(Math.round(pinchStartCenter * scale), minFont, maxFont);
+        const ne = clamp(Math.round(pinchStartEdge * scale), Math.max(minFont, 6), Math.round(maxFont * initialRatio));
+        if (nc !== centerSize || ne !== edgeSize) {
+          centerSize = nc; edgeSize = ne; layout(); onZoom?.(centerSize, edgeSize);
+        }
+      }
+      e.preventDefault(); return;
+    }
+    if (!isTouching || e.touches.length !== 1) return;
+    const y = e.touches[0].clientY;
+    const dy = touchLastY - y;
+    const now = performance.now();
+    const dt = now - touchLastTime;
+    scrollY += dy; scrollY = clamp(scrollY, -50, maxScroll + 50);
+    if (dt > 0) scrollVelocity = (dy / dt) * 16;
+    touchLastY = y; touchLastTime = now; e.preventDefault();
+  }
+
+  function onTouchEnd(e) {
+    if (e.touches.length < 2) pinchActive = false;
+    if (e.touches.length === 0) isTouching = false;
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    if ((e.ctrlKey || e.metaKey) && mode !== 'scrollMorph') {
+      const delta = e.deltaY > 0 ? -1 : 1;
+      if (mode === 'pinchType') {
+        const ns = clamp(fontSize + delta, minFont, maxFont);
+        if (ns !== fontSize) { fontSize = ns; layout(); onZoom?.(fontSize); }
+      } else {
+        const nc = clamp(centerSize + delta, minFont, maxFont);
+        if (nc !== centerSize) {
+          centerSize = nc; edgeSize = clamp(Math.round(centerSize * initialRatio), 4, centerSize);
+          layout(); onZoom?.(centerSize, edgeSize);
+        }
+      }
+    } else {
+      scrollY += e.deltaY; scrollY = clamp(scrollY, -50, maxScroll + 50);
+    }
+  }
+
+  function handleResize() {
+    dpr = Math.min(devicePixelRatio || 1, 3);
+    W = container.clientWidth; H = container.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    layout();
+  }
+
+  canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+  canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+  canvas.addEventListener('touchend', onTouchEnd);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  const ro = new ResizeObserver(handleResize);
+  ro.observe(container);
+  handleResize();
+  raf = requestAnimationFrame(loop);
+
+  return {
+    setText(text) { rawText = text; scrollY = 0; scrollVelocity = 0; layout(); },
+    get fontSize() { return fontSize; },
+    get centerSize() { return centerSize; },
+    get edgeSize() { return edgeSize; },
+    destroy() {
+      destroyed = true; cancelAnimationFrame(raf); ro.disconnect();
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.remove();
+    },
+  };
+}
+
+// ── Initialize demos ──
+
+const pinchDemo = createTextEngine(document.getElementById('demo-pinch'), {
+  mode: 'pinchType',
+  fontSize: 18,
+  onZoom(fs) { document.getElementById('pinch-size').textContent = fs + 'px'; },
+});
+
+const morphDemo = createTextEngine(document.getElementById('demo-morph'), {
+  mode: 'scrollMorph',
+  centerFontSize: 26,
+  edgeFontSize: 11,
+});
+
+const combinedDemo = createTextEngine(document.getElementById('demo-combined'), {
+  mode: 'pinchMorph',
+  centerFontSize: 26,
+  edgeFontSize: 11,
+  onZoom(c, e) {
+    document.getElementById('combined-stat').textContent = `center ${c}px · edge ${e}px`;
+  },
+});
+
+// Set sample text
+pinchDemo.setText(SAMPLE_TEXT);
+morphDemo.setText(SAMPLE_TEXT);
+combinedDemo.setText(SAMPLE_TEXT);
+
+// ── Font size buttons ──
+window.setDemoFont = function(which, delta) {
+  // Simulate a ctrl+wheel event on the pinch demo
+  const el = document.getElementById('demo-' + which);
+  el.querySelector('canvas')?.dispatchEvent(new WheelEvent('wheel', {
+    deltaY: delta > 0 ? -1 : 1,
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  }));
+};
+
+// ── PDF upload ──
+const uploadArea = document.getElementById('uploadArea');
+const fileInput = document.getElementById('fileInput');
+uploadArea.addEventListener('click', () => fileInput.click());
+uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.style.borderColor = '#c44b2b'; });
+uploadArea.addEventListener('dragleave', () => { uploadArea.style.borderColor = '#c4bdb2'; });
+uploadArea.addEventListener('drop', async e => {
+  e.preventDefault(); uploadArea.style.borderColor = '#c4bdb2';
+  const file = e.dataTransfer.files[0];
+  if (file?.type === 'application/pdf') await loadPDF(file);
+});
+fileInput.addEventListener('change', async e => {
+  if (e.target.files[0]) await loadPDF(e.target.files[0]);
+});
+
+async function loadPDF(file) {
+  uploadArea.querySelector('p').textContent = 'Loading ' + file.name + '...';
+  try {
+    const pdfjsLib = await import('https://esm.sh/pdfjs-dist@4.9.155/build/pdf.min.mjs');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.9.155/build/pdf.worker.min.mjs';
+    const data = new Uint8Array(await file.arrayBuffer());
+    const doc = await pdfjsLib.getDocument({ data }).promise;
+
+    let allText = '';
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      let pageText = '';
+      let lastY = null, lastFS = 12;
+      for (const item of content.items) {
+        if (!item.str) continue;
+        if (item.transform) {
+          const cy = item.transform[5];
+          const fh = Math.hypot(item.transform[2], item.transform[3]);
+          if (fh > 0) lastFS = fh;
+          if (lastY !== null) {
+            const gap = Math.abs(cy - lastY);
+            if (gap > lastFS * 1.8) pageText += '\n\n';
+            else if (gap > lastFS * 0.3 && !pageText.endsWith(' ') && !pageText.endsWith('\n')) pageText += ' ';
+          }
+          lastY = cy;
+        }
+        pageText += item.str;
+      }
+      if (i > 1) allText += '\n\n';
+      allText += pageText.trim();
+    }
+
+    pinchDemo.setText(allText);
+    morphDemo.setText(allText);
+    combinedDemo.setText(allText);
+    uploadArea.querySelector('p').textContent = `✓ ${file.name} — ${doc.numPages} pages loaded`;
+    await doc.destroy();
+  } catch (err) {
+    uploadArea.querySelector('p').textContent = 'Error: ' + err.message;
+  }
+}
+</script>
+
+</body>
+</html>

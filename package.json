@@ -1,0 +1,42 @@
+{
+  "name": "pretext-pdfjs",
+  "version": "0.1.0",
+  "description": "Fork of PDF.js with @chenglou/pretext-native text layer — zero DOM reflows for text measurement",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./text-layer": "./src/pretext-text-layer.js",
+    "./measurement-cache": "./src/measurement-cache.js",
+    "./viewer": "./src/viewer.js",
+    "./pinch": "./src/pinch.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "Apache-2.0",
+  "keywords": [
+    "pdf",
+    "pretext",
+    "text-layer",
+    "pdfjs",
+    "pdf.js",
+    "viewer",
+    "zero-reflow",
+    "canvas",
+    "text-measurement"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pretext-pdf/pretext-pdf"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "^0.0.3",
+    "pdfjs-dist": "^4.9.155"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
