@@ -1,6 +1,6 @@
 {
   "name": "pretext-pdfjs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Fork of PDF.js with @chenglou/pretext-native text layer — zero DOM reflows for text measurement",
   "type": "module",
   "main": "./src/index.js",

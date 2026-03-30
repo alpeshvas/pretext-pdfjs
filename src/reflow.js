@@ -61,12 +61,20 @@ function groupTextBlocks(textItems, pageHeight, styles) {
     const verticalGap = Math.abs(y - lastY);
 
     // Split block on significant font size change (headings vs body)
+    // But don't split for superscripts/markers that are horizontally adjacent
     const sizeRatio = fontHeight > 0 && lastFH > 0
       ? Math.max(fontHeight, lastFH) / Math.min(fontHeight, lastFH)
       : 1;
+    const lastX = lastItem.transform[4];
+    const lastW = lastItem.width || lastFH;
+    const hGap = x - (lastX + lastW);
+    const isHorizAdjacent = hGap < lastFH * 0.5 && hGap > -lastFH;
+    const isShortItem = (item.str || "").trim().length <= 2;
+    const isSuperscript = isShortItem && isHorizAdjacent && sizeRatio > 1.3;
+    const sizeOk = sizeRatio < 1.3 || isSuperscript;
 
     if (
-      sizeRatio < 1.3 &&
+      sizeOk &&
       verticalGap < lastFH * 2.5 &&
       x < current.bbox.x + current.bbox.w + lastFH * 2
     ) {
@@ -248,11 +256,33 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
     }
   }
 
-  // Sort by reading order: top to bottom, then left to right
-  regions.sort((a, b) => {
-    if (Math.abs(a.bbox.y - b.bbox.y) > 10) return a.bbox.y - b.bbox.y;
-    return a.bbox.x - b.bbox.x;
-  });
+  // Detect columns: find the midpoint X where blocks cluster on left vs right
+  const pageWidth = Math.max(...regions.map(r => r.bbox.x + r.bbox.w), 1);
+  const midX = pageWidth / 2;
+  const leftBlocks = regions.filter(r => r.bbox.x + r.bbox.w / 2 < midX);
+  const rightBlocks = regions.filter(r => r.bbox.x + r.bbox.w / 2 >= midX);
+  const hasColumns = leftBlocks.length > 2 && rightBlocks.length > 2 &&
+    rightBlocks.some(r => leftBlocks.some(l => Math.abs(l.bbox.y - r.bbox.y) < 20));
+
+  if (hasColumns) {
+    // Two-column: sort each column top-to-bottom, then concatenate
+    // Full-width blocks (spanning > 60% of page) go first, sorted by Y
+    const fullWidth = regions.filter(r => r.bbox.w > pageWidth * 0.6);
+    const leftCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 < midX);
+    const rightCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 >= midX);
+    const byY = (a, b) => a.bbox.y - b.bbox.y;
+    fullWidth.sort(byY);
+    leftCol.sort(byY);
+    rightCol.sort(byY);
+    regions.length = 0;
+    regions.push(...fullWidth, ...leftCol, ...rightCol);
+  } else {
+    // Single column: sort by Y then X
+    regions.sort((a, b) => {
+      if (Math.abs(a.bbox.y - b.bbox.y) > 10) return a.bbox.y - b.bbox.y;
+      return a.bbox.x - b.bbox.x;
+    });
+  }
 
   return regions;
 }
@@ -363,9 +393,7 @@ function reflowAndComposite(analysis, opts) {
       const blockFontSize = Math.round(fontSize * (block.fontScale || 1));
       const blockLH = blockFontSize * lineHeight;
       const style = block.isItalic ? "italic" : "normal";
-      // Headings get lighter weight to match typical PDF display fonts
-      const scale = block.fontScale || 1;
-      const weight = block.isBold ? 700 : scale > 1.8 ? 300 : scale > 1.3 ? 400 : 400;
+      const weight = block.isBold ? 700 : 400;
       // Use PDF's detected font family if available, otherwise fall back to configured
       const blockFamily = block.pdfFontFamily
         ? `${block.pdfFontFamily}, ${fontFamily}`
