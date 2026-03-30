@@ -338,6 +338,7 @@ const SAMPLE_URL = "https://mozilla.github.io/pdf.js/web/compressed.tracemonkey-
 // ── State ──
 let pdfjs = null;
 let pdfDoc = null;
+let pdfSource = null; // stored source for re-opening in other renderers
 let currentMode = "document";
 let currentPage = 1;
 let numPages = 0;
@@ -371,6 +372,7 @@ async function loadPDF(source, name) {
   await ensurePdfjs();
   statusText.textContent = "Loading...";
 
+  pdfSource = source;
   const loadParams = typeof source === "string"
     ? { url: source }
     : { data: source };
@@ -462,15 +464,7 @@ async function switchMode(mode) {
       onZoom: (fs) => { fontSize = fs; updateZoomLabel(); },
     });
 
-    // Open using the same pdfDoc's underlying data
-    // Re-open to let reflow manage its own pdfjs instance
-    const url = pdfDoc._transport?._params?.url;
-    const data = pdfDoc._transport?._params?.data;
-    if (url) {
-      await activeRenderer.open(url);
-    } else if (data) {
-      await activeRenderer.open(data);
-    }
+    await activeRenderer.open(pdfSource);
     await activeRenderer.showPage(currentPage);
     updateZoomLabel();
   } else if (mode === "reader" || mode === "reader-morph") {
@@ -498,13 +492,7 @@ async function switchMode(mode) {
       onZoom: (fs) => { if (typeof fs === "number") { fontSize = fs; updateZoomLabel(); } },
     });
 
-    const url = pdfDoc._transport?._params?.url;
-    const data = pdfDoc._transport?._params?.data;
-    if (url) {
-      await activeRenderer.open(url);
-    } else if (data) {
-      await activeRenderer.open(data);
-    }
+    await activeRenderer.open(pdfSource);
     await activeRenderer.showPage(currentPage);
     updateZoomLabel();
   }
