@@ -4,7 +4,7 @@ Pretext-native text layer for PDF.js.
 
 *Use PDF.js for parsing and rendering. Use pretext-pdfjs for the text layer.*
 
-**[Live Demo →](https://pretext-pdfjs.surge.sh)** · **[npm](https://www.npmjs.com/package/pretext-pdfjs)**
+**[npm](https://www.npmjs.com/package/pretext-pdfjs)**
 
 ---
 
