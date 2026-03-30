@@ -834,7 +834,7 @@ export function createReflowRenderer(container, options = {}) {
   const maxFont = options.maxFontSize ?? 48;
   const fontFamily = options.fontFamily ?? '"Literata", Georgia, serif';
   const lhRatio = options.lineHeight ?? 1.6;
-  const padding = options.padding ?? 24;
+  let padding = options.padding ?? 24;
   const bg = options.background ?? "#f4f1eb";
   const textColor = options.textColor ?? "#252320";
   const imageFit = options.imageFit ?? "proportional";
@@ -847,6 +847,8 @@ export function createReflowRenderer(container, options = {}) {
   const morphRadius = options.morphRadius ?? 300;
   const edgeFontRatio = options.edgeFontRatio ?? 0.5;
   const maxWidth = options.maxWidth ?? Infinity;
+  const autoDetectPadding = options.autoDetectPadding ?? true;
+  const minPadding = options.minPadding ?? 20;
 
   let pdfjs = null;
   let pdfDoc = null;
@@ -897,6 +899,15 @@ export function createReflowRenderer(container, options = {}) {
 
   function reflow() {
     if (!currentAnalysis || W === 0) return;
+    // Auto-detect padding from PDF page margins
+    if (autoDetectPadding && currentAnalysis.textBlocks.length > 0 && currentAnalysis.pageWidth > 0) {
+      const minX = Math.min(...currentAnalysis.textBlocks.map(b => b.bbox.x));
+      const maxX = Math.max(...currentAnalysis.textBlocks.map(b => b.bbox.x + b.bbox.w));
+      const rightMargin = currentAnalysis.pageWidth - maxX;
+      const pdfMargin = Math.min(minX, rightMargin);
+      const marginRatio = pdfMargin / currentAnalysis.pageWidth;
+      padding = Math.round(Math.max(minPadding, W * marginRatio));
+    }
     const result = reflowAndComposite(currentAnalysis, {
       fontSize, fontFamily, lineHeight: lhRatio, padding,
       background: bg, textColor, imageFit, canvasW: W, canvasH: H, dpr,
@@ -1159,6 +1170,8 @@ export function createReflowRenderer(container, options = {}) {
         pageNum,
         textBlocks: currentAnalysis.textBlocks,
         graphicRegions: currentAnalysis.graphicRegions,
+        pageWidth: currentAnalysis.pageWidth,
+        pageHeight: currentAnalysis.pageHeight,
       });
     },
 
@@ -1230,6 +1243,13 @@ export function createReflowRenderer(container, options = {}) {
       analysisCache.clear();
       pdfDoc?.destroy();
       pdfDoc = null;
+    },
+
+    setPadding(newPadding) {
+      if (newPadding !== padding) {
+        padding = newPadding;
+        reflow();
+      }
     },
 
     setFontSize(newSize) {
