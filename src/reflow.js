@@ -189,8 +189,7 @@ function groupTextBlocks(textItems, pageHeight, styles) {
  * Only captures image operators (paintImageXObject etc).
  * Skips path/fill/stroke to avoid false positives from text decorations.
  */
-async function extractGraphicRegions(page, OPS) {
-  const ops = await page.getOperatorList();
+function extractGraphicRegions(opList, OPS) {
   const regions = [];
   const ctmStack = [];
   let ctm = [1, 0, 0, 1, 0, 0];
@@ -216,9 +215,9 @@ async function extractGraphicRegions(page, OPS) {
     return [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
   }
 
-  for (let i = 0; i < ops.fnArray.length; i++) {
-    const fn = ops.fnArray[i];
-    const args = ops.argsArray[i];
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    const args = opList.argsArray[i];
 
     if (fn === OPS.save) {
       ctmStack.push(ctm.slice());
@@ -506,10 +505,23 @@ async function analyzePage(page, OPS) {
     block.fontScale = block.avgFontSize / bodyFontSize;
   }
 
-  // Get graphic regions from image operators
-  const opGraphicRegions = await extractGraphicRegions(page, OPS);
+  // Get operator list once (reused for text/non-text classification + image extraction)
+  const opList = await page.getOperatorList();
 
-  // Render full page to offscreen canvas for bitmap extraction
+  // Identify text operation indices for operationsFilter
+  const textOpIndices = new Set();
+  let inTextBlock = false;
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    if (fn === OPS.beginText) inTextBlock = true;
+    if (inTextBlock) textOpIndices.add(i);
+    if (fn === OPS.endText) inTextBlock = false;
+  }
+
+  // Extract graphic regions from operator list CTM tracking
+  const opGraphicRegions = extractGraphicRegions(opList, OPS);
+
+  // Render non-text only (images, paths, fills, backgrounds)
   const renderScale = 2;
   const offCanvas = document.createElement("canvas");
   offCanvas.width = Math.floor(pageWidth * renderScale);
@@ -520,13 +532,52 @@ async function analyzePage(page, OPS) {
   await page.render({
     canvasContext: offCtx,
     viewport: renderViewport,
+    operationsFilter: (index) => !textOpIndices.has(index),
   }).promise;
 
-  // Also detect graphics from rendered canvas (catches vector graphics)
+  // Get precise image coordinates via recordImages (supplements CTM detection)
+  let imageCoordRegions = [];
+  try {
+    const imgTrackCanvas = document.createElement("canvas");
+    imgTrackCanvas.width = offCanvas.width;
+    imgTrackCanvas.height = offCanvas.height;
+    const imgRenderTask = page.render({
+      canvasContext: imgTrackCanvas.getContext("2d"),
+      viewport: renderViewport,
+      recordImages: true,
+    });
+    await imgRenderTask.promise;
+    const imageCoords = imgRenderTask.imageCoordinates;
+    if (imageCoords && imageCoords.length > 0) {
+      for (let j = 0; j < imageCoords.length; j += 6) {
+        const x1 = imageCoords[j], y1 = imageCoords[j + 1];
+        const x2 = imageCoords[j + 2], y2 = imageCoords[j + 3];
+        const x3 = imageCoords[j + 4], y3 = imageCoords[j + 5];
+        const xs = [x1, x2, x3];
+        const ys = [y1, y2, y3];
+        const minX = Math.min(...xs) / renderScale;
+        const maxX = Math.max(...xs) / renderScale;
+        const minY = Math.min(...ys) / renderScale;
+        const maxY = Math.max(...ys) / renderScale;
+        if (maxX - minX > 10 && maxY - minY > 10) {
+          imageCoordRegions.push({
+            type: "graphic",
+            bbox: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+            screenCoords: true,
+          });
+        }
+      }
+    }
+  } catch (_) {
+    // recordImages not supported — CTM fallback is used
+  }
+
+  // Detect graphics from rendered non-text canvas (catches vector graphics)
   const renderGraphicRegions = detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale);
-  // Merge op-based and render-based, deduplicating by overlap
+
+  // Merge all sources, deduplicating by overlap
   const graphicRegions = [...opGraphicRegions];
-  for (const rg of renderGraphicRegions) {
+  for (const rg of [...imageCoordRegions, ...renderGraphicRegions]) {
     const overlapsExisting = graphicRegions.some(og => {
       const ogBbox = og.screenCoords
         ? og.bbox
@@ -665,80 +716,6 @@ function reflowAndComposite(analysis, opts) {
   return { totalHeight, reflowedRegions, fullPageFallback: false };
 }
 
-/**
- * Draw the reflowed content to canvas.
- */
-function drawComposite(ctx, reflowedRegions, analysis, opts, scrollY) {
-  const {
-    fontSize, fontFamily, lineHeight, padding,
-    background, textColor, canvasW, canvasH, dpr,
-  } = opts;
-
-  const d = dpr;
-  const baseLH = fontSize * lineHeight;
-
-  ctx.fillStyle = background;
-  ctx.fillRect(0, 0, canvasW * d, canvasH * d);
-
-  // Full page fallback
-  if (reflowedRegions.length === 0 && analysis.offCanvas) {
-    const availableWidth = canvasW - padding * 2;
-    const scale = Math.min(availableWidth / analysis.pageWidth, 1);
-    ctx.drawImage(
-      analysis.offCanvas,
-      padding * d, padding * d,
-      analysis.pageWidth * scale * d,
-      analysis.pageHeight * scale * d
-    );
-    return;
-  }
-
-  let cursorY = padding;
-  ctx.textBaseline = "top";
-
-  for (const r of reflowedRegions) {
-    if (r.type === "text" && r.lines) {
-      const fs = r.fontSize || fontSize;
-      const lh = r.lineHeight || baseLH;
-      const style = r.fontStyle || "normal";
-      const weight = r.fontWeight || 400;
-
-      ctx.fillStyle = textColor;
-      ctx.font = `${style} ${weight} ${fs * d}px ${fontFamily}`;
-      const centered = r.align === "center";
-
-      for (const line of r.lines) {
-        const screenY = cursorY - scrollY;
-        if (screenY > -lh && screenY < canvasH + lh) {
-          if (centered) {
-            ctx.textAlign = "center";
-            ctx.fillText(line.text, (canvasW / 2) * d, screenY * d);
-            ctx.textAlign = "left";
-          } else {
-            ctx.fillText(line.text, padding * d, screenY * d);
-          }
-        }
-        cursorY += lh;
-      }
-    } else if (r.type === "graphic" && r.bitmap) {
-      const screenY = cursorY - scrollY;
-      if (screenY > -r.drawH && screenY < canvasH + r.drawH) {
-        const tmpCanvas = document.createElement("canvas");
-        tmpCanvas.width = r.bitmap.data.width;
-        tmpCanvas.height = r.bitmap.data.height;
-        tmpCanvas.getContext("2d").putImageData(r.bitmap.data, 0, 0);
-        ctx.drawImage(
-          tmpCanvas,
-          padding * d, screenY * d,
-          r.drawW * d, r.drawH * d
-        );
-      }
-      cursorY += r.drawH;
-    }
-    cursorY += baseLH * 0.4;
-  }
-}
-
 // ─── Main API ─────────────────────────────────────────────────────────────
 
 export function createReflowRenderer(container, options = {}) {
@@ -755,6 +732,10 @@ export function createReflowRenderer(container, options = {}) {
   const friction = options.friction ?? 0.95;
   const onZoom = options.onZoom;
   const onPageReady = options.onPageReady;
+  const enableMorph = options.enableMorph ?? false;
+  const morphRadius = options.morphRadius ?? 300;
+  const edgeFontRatio = options.edgeFontRatio ?? 0.5;
+  const maxWidth = options.maxWidth ?? Infinity;
 
   let pdfjs = null;
   let pdfDoc = null;
@@ -821,7 +802,6 @@ export function createReflowRenderer(container, options = {}) {
       ctx.fillRect(0, 0, W * dpr, H * dpr);
       return;
     }
-    // Inline draw for performance (avoid function call overhead in rAF)
     const d = dpr;
     const baseLH = fontSize * lhRatio;
 
@@ -842,25 +822,52 @@ export function createReflowRenderer(container, options = {}) {
 
     let cursorY = padding;
     ctx.textBaseline = "top";
+    const viewCenter = H / 2;
 
     for (const r of reflowedRegions) {
       if (r.type === "text" && r.lines) {
         const fs = r.fontSize || fontSize;
         const lh = r.lineHeight || baseLH;
         const rFamily = r.fontFamily || fontFamily;
-        ctx.fillStyle = textColor;
-        ctx.font = `${r.fontStyle || "normal"} ${r.fontWeight || 400} ${fs * d}px ${rFamily}`;
+        const style = r.fontStyle || "normal";
+        const weight = r.fontWeight || 400;
         const centered = r.align === "center";
+
+        if (!enableMorph) {
+          ctx.fillStyle = textColor;
+          ctx.font = `${style} ${weight} ${fs * d}px ${rFamily}`;
+        }
 
         for (const line of r.lines) {
           const screenY = cursorY - scrollY;
           if (screenY > -lh && screenY < H + lh) {
-            if (centered) {
-              ctx.textAlign = "center";
-              ctx.fillText(line.text, (W / 2) * d, screenY * d);
-              ctx.textAlign = "left";
+            if (enableMorph) {
+              const dist = Math.abs(screenY - viewCenter);
+              const t = Math.min(dist / morphRadius, 1);
+              const ease = 1 - (1 - t) ** 3;
+              const morphedFS = fs * (1 - ease * (1 - edgeFontRatio));
+              const opacity = 1.0 + (0.2 - 1.0) * ease;
+              const c = Math.round(37 - (37 - 160) * ease);
+              ctx.save();
+              ctx.globalAlpha = opacity;
+              ctx.fillStyle = `rgb(${c},${c - 2},${c - 3})`;
+              ctx.font = `${style} ${weight} ${morphedFS * d}px ${rFamily}`;
+              if (centered) {
+                ctx.textAlign = "center";
+                ctx.fillText(line.text, (W / 2) * d, screenY * d);
+                ctx.textAlign = "left";
+              } else {
+                ctx.fillText(line.text, padding * d, screenY * d);
+              }
+              ctx.restore();
             } else {
-              ctx.fillText(line.text, padding * d, screenY * d);
+              if (centered) {
+                ctx.textAlign = "center";
+                ctx.fillText(line.text, (W / 2) * d, screenY * d);
+                ctx.textAlign = "left";
+              } else {
+                ctx.fillText(line.text, padding * d, screenY * d);
+              }
             }
           }
           cursorY += lh;
@@ -869,7 +876,19 @@ export function createReflowRenderer(container, options = {}) {
         const screenY = cursorY - scrollY;
         if (screenY > -r.drawH && screenY < H + r.drawH) {
           const tmp = getTmpCanvas(r.bitmap);
-          ctx.drawImage(tmp, padding * d, screenY * d, r.drawW * d, r.drawH * d);
+          if (enableMorph) {
+            const dist = Math.abs(screenY + r.drawH / 2 - viewCenter);
+            const t = Math.min(dist / morphRadius, 1);
+            const ease = 1 - (1 - t) ** 3;
+            const imgScale = 1 - ease * (1 - edgeFontRatio);
+            const opacity = 1.0 + (0.2 - 1.0) * ease;
+            ctx.save();
+            ctx.globalAlpha = opacity;
+            ctx.drawImage(tmp, padding * d, screenY * d, r.drawW * imgScale * d, r.drawH * imgScale * d);
+            ctx.restore();
+          } else {
+            ctx.drawImage(tmp, padding * d, screenY * d, r.drawW * d, r.drawH * d);
+          }
         }
         cursorY += r.drawH;
       }
@@ -965,7 +984,7 @@ export function createReflowRenderer(container, options = {}) {
 
   function handleResize() {
     dpr = Math.min(devicePixelRatio || 1, 3);
-    W = Math.min(container.clientWidth, 680);
+    W = Math.min(container.clientWidth, maxWidth);
     H = container.clientHeight;
     canvas.width = W * dpr;
     canvas.height = H * dpr;

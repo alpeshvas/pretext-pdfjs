@@ -339,12 +339,50 @@ function createTextCanvas(container, opts = {}) {
  * @param {Function} [options.onPageLoad] - called with { pageNum, text, numPages }
  */
 export function createPDFPinchReader(container, options = {}) {
+  const preserveLayout = options.preserveLayout ?? false;
+  const mode = options.mode || "pinchType";
+
+  // When preserveLayout is true, delegate to the reflow engine
+  if (preserveLayout) {
+    let reflowRenderer = null;
+
+    return {
+      async open(source) {
+        const { createReflowRenderer } = await import("./reflow.js");
+        reflowRenderer = createReflowRenderer(container, {
+          fontSize: options.fontSize ?? 18,
+          minFontSize: options.minFontSize ?? 8,
+          maxFontSize: options.maxFontSize ?? 60,
+          fontFamily: options.fontFamily,
+          lineHeight: options.lineHeight ?? 1.6,
+          padding: options.padding ?? 28,
+          background: options.background ?? "#0a0a0a",
+          textColor: options.textColor ?? "#e5e5e5",
+          enablePinchZoom: true,
+          enableMorph: mode === "pinchMorph" || mode === "scrollMorph",
+          friction: options.friction ?? 0.95,
+          workerSrc: options.workerSrc,
+          onZoom: options.onZoom,
+        });
+        return reflowRenderer.open(source);
+      },
+      async showPage(pageNum) { return reflowRenderer.showPage(pageNum); },
+      async showAll() { return reflowRenderer.showAll(); },
+      async nextPage() { return reflowRenderer.nextPage(); },
+      async prevPage() { return reflowRenderer.prevPage(); },
+      resize() { /* handled by ResizeObserver in reflow */ },
+      destroy() { reflowRenderer?.destroy(); },
+      get currentPage() { return reflowRenderer?.currentPage ?? 0; },
+      get numPages() { return reflowRenderer?.numPages ?? 0; },
+      get canvas() { return reflowRenderer?.canvas ?? null; },
+      get mode() { return mode; },
+    };
+  }
+
   let pdfjs = null;
   let pdfDoc = null;
   let textInstance = null;
   let currentPage = 0;
-
-  const mode = options.mode || "pinchType";
 
   async function ensurePdfjs() {
     if (pdfjs) return;
