@@ -73,10 +73,20 @@ function groupTextBlocks(textItems, pageHeight, styles) {
     const isSuperscript = isShortItem && isHorizAdjacent && sizeRatio > 1.3;
     const sizeOk = sizeRatio < 1.3 || isSuperscript;
 
+    // Large horizontal gap between consecutive items → likely column break
+    // Positive gap: item far right of last item (left→right column jump)
+    // Negative position: item far left of block start (right→left column jump)
+    if (hGap > lastFH * 1.5 ||
+        (current.bbox.w > lastFH * 10 && x < current.bbox.x - lastFH * 3)) {
+      blocks.push(current);
+      current = { items: [item], bbox: { x, y, w: item.width || 0, h: fontHeight } };
+      continue;
+    }
+
     if (
       sizeOk &&
       verticalGap < lastFH * 2.5 &&
-      x < current.bbox.x + current.bbox.w + lastFH * 2
+      x < current.bbox.x + current.bbox.w + lastFH * 1.5
     ) {
       current.items.push(item);
       current.bbox.x = Math.min(current.bbox.x, x);
@@ -93,6 +103,44 @@ function groupTextBlocks(textItems, pageHeight, styles) {
     }
   }
   if (current) blocks.push(current);
+
+  // Post-process: merge orphan tiny blocks (superscripts, markers like *, +, #)
+  // into the nearest larger block if vertically close
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (block.items.length > 2) continue;
+    const text = block.items.map(it => (it.str || "").trim()).join("");
+    if (text.length > 3 || text.length === 0) continue;
+
+    let bestIdx = -1, bestDist = Infinity;
+    for (let j = 0; j < blocks.length; j++) {
+      if (j === i || blocks[j].items.length <= 1) continue;
+      const o = blocks[j];
+      // Check vertical proximity: block center within other's vertical extent + margin
+      const bcy = block.bbox.y + block.bbox.h / 2;
+      if (bcy < o.bbox.y - o.bbox.h * 0.5 || bcy > o.bbox.y + o.bbox.h * 1.5) continue;
+      // Horizontal edge-to-edge distance (0 if overlapping)
+      const hDist = Math.max(0,
+        block.bbox.x > o.bbox.x + o.bbox.w ? block.bbox.x - (o.bbox.x + o.bbox.w) :
+        o.bbox.x > block.bbox.x + block.bbox.w ? o.bbox.x - (block.bbox.x + block.bbox.w) : 0);
+      if (hDist < bestDist) {
+        bestDist = hDist;
+        bestIdx = j;
+      }
+    }
+
+    if (bestIdx >= 0 && bestDist < (blocks[bestIdx].bbox.h || 20)) {
+      const target = blocks[bestIdx];
+      target.items.push(...block.items);
+      const newX = Math.min(target.bbox.x, block.bbox.x);
+      const newRight = Math.max(target.bbox.x + target.bbox.w, block.bbox.x + block.bbox.w);
+      const newBottom = Math.max(target.bbox.y + target.bbox.h, block.bbox.y + block.bbox.h);
+      target.bbox.x = newX;
+      target.bbox.w = newRight - newX;
+      target.bbox.h = newBottom - target.bbox.y;
+      blocks.splice(i, 1);
+    }
+  }
 
   // Compute font metadata per block
   for (const block of blocks) {
@@ -201,6 +249,92 @@ async function extractGraphicRegions(page, OPS) {
 }
 
 /**
+ * Detect graphic regions by scanning the rendered canvas for non-text content.
+ * Complements op-based detection by also finding vector graphics (charts, diagrams).
+ */
+function detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale) {
+  const w = offCanvas.width;
+  const h = offCanvas.height;
+  const ctx = offCanvas.getContext("2d");
+
+  const cellPx = 16;
+  const cols = Math.ceil(w / cellPx);
+  const rows = Math.ceil(h / cellPx);
+  const occupied = new Uint8Array(cols * rows);
+
+  // Mark cells covered by text blocks
+  for (const block of textBlocks) {
+    const margin = 4 * renderScale;
+    const x0 = Math.floor(Math.max(0, block.bbox.x * renderScale - margin) / cellPx);
+    const y0 = Math.floor(Math.max(0, block.bbox.y * renderScale - margin) / cellPx);
+    const x1 = Math.ceil(Math.min(w, (block.bbox.x + block.bbox.w) * renderScale + margin) / cellPx);
+    const y1 = Math.ceil(Math.min(h, (block.bbox.y + block.bbox.h) * renderScale + margin) / cellPx);
+    for (let cy = y0; cy < y1 && cy < rows; cy++)
+      for (let cx = x0; cx < x1 && cx < cols; cx++)
+        occupied[cy * cols + cx] = 1;
+  }
+
+  // Scan non-text cells for visible content
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const pixels = imgData.data;
+  const hasContent = new Uint8Array(cols * rows);
+
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      if (occupied[cy * cols + cx]) continue;
+      const px0 = cx * cellPx, py0 = cy * cellPx;
+      const px1 = Math.min(px0 + cellPx, w), py1 = Math.min(py0 + cellPx, h);
+      let dark = 0, total = 0;
+      for (let py = py0; py < py1; py += 2) {
+        for (let px = px0; px < px1; px += 2) {
+          const idx = (py * w + px) * 4;
+          if (pixels[idx + 3] > 20) {
+            const lum = 0.299 * pixels[idx] + 0.587 * pixels[idx + 1] + 0.114 * pixels[idx + 2];
+            if (lum < 240) dark++;
+          }
+          total++;
+        }
+      }
+      if (total > 0 && dark / total > 0.05) hasContent[cy * cols + cx] = 1;
+    }
+  }
+
+  // Connected-component labeling to find graphic regions
+  const visited = new Uint8Array(cols * rows);
+  const regions = [];
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      if (!hasContent[cy * cols + cx] || visited[cy * cols + cx]) continue;
+      const queue = [[cx, cy]];
+      visited[cy * cols + cx] = 1;
+      let minX = cx, maxX = cx, minY = cy, maxY = cy, count = 0;
+      while (queue.length > 0) {
+        const [qx, qy] = queue.shift();
+        minX = Math.min(minX, qx); maxX = Math.max(maxX, qx);
+        minY = Math.min(minY, qy); maxY = Math.max(maxY, qy);
+        count++;
+        for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+          const nx = qx + dx, ny = qy + dy;
+          if (nx >= 0 && nx < cols && ny >= 0 && ny < rows &&
+              hasContent[ny * cols + nx] && !visited[ny * cols + nx]) {
+            visited[ny * cols + nx] = 1;
+            queue.push([nx, ny]);
+          }
+        }
+      }
+      const rx = minX * cellPx / renderScale;
+      const ry = minY * cellPx / renderScale;
+      const rw = (maxX - minX + 1) * cellPx / renderScale;
+      const rh = (maxY - minY + 1) * cellPx / renderScale;
+      if (rw > 30 && rh > 30 && count > 4) {
+        regions.push({ type: "graphic", bbox: { x: rx, y: ry, w: rw, h: rh }, screenCoords: true });
+      }
+    }
+  }
+  return regions;
+}
+
+/**
  * Build text content for a block, preserving paragraph breaks.
  */
 function blockToText(block, pageHeight) {
@@ -245,9 +379,10 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
   }
 
   for (const gr of graphicRegions) {
-    // PDF coords: y is from bottom → convert to top-down
-    const topY = pageHeight - gr.bbox.y - gr.bbox.h;
-    const bbox = { x: gr.bbox.x, y: topY, w: gr.bbox.w, h: gr.bbox.h };
+    // Render-based regions are already in screen coords; op-based need conversion
+    const bbox = gr.screenCoords
+      ? { ...gr.bbox }
+      : { x: gr.bbox.x, y: pageHeight - gr.bbox.y - gr.bbox.h, w: gr.bbox.w, h: gr.bbox.h };
 
     // Skip if this graphic region overlaps significantly with any text block
     const overlapsText = textBboxes.some(tb => bboxOverlap(bbox, tb) > 0.3);
@@ -256,28 +391,83 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
     }
   }
 
-  // Detect columns: find the midpoint X where blocks cluster on left vs right
+  // ── Column detection via histogram gap-finding ──
   const pageWidth = Math.max(...regions.map(r => r.bbox.x + r.bbox.w), 1);
-  const midX = pageWidth / 2;
-  const leftBlocks = regions.filter(r => r.bbox.x + r.bbox.w / 2 < midX);
-  const rightBlocks = regions.filter(r => r.bbox.x + r.bbox.w / 2 >= midX);
-  const hasColumns = leftBlocks.length > 2 && rightBlocks.length > 2 &&
-    rightBlocks.some(r => leftBlocks.some(l => Math.abs(l.bbox.y - r.bbox.y) < 20));
+  const narrowBlocks = regions.filter(r => r.bbox.w <= pageWidth * 0.6);
+  let gapX = pageWidth / 2;
+  let hasColumns = false;
 
+  if (narrowBlocks.length >= 4) {
+    // Build horizontal coverage histogram
+    const binCount = 100;
+    const binWidth = pageWidth / binCount;
+    const coverage = new Uint8Array(binCount);
+    for (const r of narrowBlocks) {
+      const b0 = Math.max(0, Math.floor(r.bbox.x / binWidth));
+      const b1 = Math.min(binCount, Math.ceil((r.bbox.x + r.bbox.w) / binWidth));
+      for (let b = b0; b < b1; b++) coverage[b]++;
+    }
+
+    // Find widest empty gap in middle 60% of page
+    const searchStart = Math.floor(binCount * 0.2);
+    const searchEnd = Math.ceil(binCount * 0.8);
+    let gapStart = -1, gapLen = 0, bestStart = -1, bestLen = 0;
+    for (let b = searchStart; b < searchEnd; b++) {
+      if (coverage[b] === 0) {
+        if (gapStart < 0) gapStart = b;
+        gapLen = b - gapStart + 1;
+      } else {
+        if (gapLen > bestLen) { bestLen = gapLen; bestStart = gapStart; }
+        gapStart = -1; gapLen = 0;
+      }
+    }
+    if (gapLen > bestLen) { bestLen = gapLen; bestStart = gapStart; }
+
+    if (bestLen >= 2) {
+      gapX = (bestStart + bestLen / 2) * binWidth;
+      const leftCount = narrowBlocks.filter(r => r.bbox.x + r.bbox.w / 2 < gapX).length;
+      const rightCount = narrowBlocks.filter(r => r.bbox.x + r.bbox.w / 2 >= gapX).length;
+      hasColumns = leftCount > 2 && rightCount > 2;
+    }
+  }
+
+  // ── Detect text alignment per block ──
+  for (const region of regions) {
+    if (region.type !== "text") continue;
+    const block = region.block;
+    const leftMargin = block.bbox.x;
+    const rightMargin = pageWidth - (block.bbox.x + block.bbox.w);
+    const marginDiff = Math.abs(leftMargin - rightMargin);
+    if (hasColumns && block.bbox.w <= pageWidth * 0.6) {
+      block.align = "left"; // column blocks are always left-aligned
+    } else if (leftMargin > pageWidth * 0.05 && marginDiff < pageWidth * 0.1) {
+      block.align = "center";
+    } else {
+      block.align = "left";
+    }
+  }
+
+  // ── Sort in reading order ──
   if (hasColumns) {
-    // Two-column: sort each column top-to-bottom, then concatenate
-    // Full-width blocks (spanning > 60% of page) go first, sorted by Y
     const fullWidth = regions.filter(r => r.bbox.w > pageWidth * 0.6);
-    const leftCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 < midX);
-    const rightCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 >= midX);
+    const leftCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 < gapX);
+    const rightCol = regions.filter(r => r.bbox.w <= pageWidth * 0.6 && r.bbox.x + r.bbox.w / 2 >= gapX);
     const byY = (a, b) => a.bbox.y - b.bbox.y;
     fullWidth.sort(byY);
     leftCol.sort(byY);
     rightCol.sort(byY);
+
+    // Interleave: full-width blocks mark section boundaries
     regions.length = 0;
-    regions.push(...fullWidth, ...leftCol, ...rightCol);
+    let li = 0, ri = 0;
+    for (const fw of fullWidth) {
+      while (li < leftCol.length && leftCol[li].bbox.y < fw.bbox.y) regions.push(leftCol[li++]);
+      while (ri < rightCol.length && rightCol[ri].bbox.y < fw.bbox.y) regions.push(rightCol[ri++]);
+      regions.push(fw);
+    }
+    while (li < leftCol.length) regions.push(leftCol[li++]);
+    while (ri < rightCol.length) regions.push(rightCol[ri++]);
   } else {
-    // Single column: sort by Y then X
     regions.sort((a, b) => {
       if (Math.abs(a.bbox.y - b.bbox.y) > 10) return a.bbox.y - b.bbox.y;
       return a.bbox.x - b.bbox.x;
@@ -312,8 +502,8 @@ async function analyzePage(page, OPS) {
     block.fontScale = block.avgFontSize / bodyFontSize;
   }
 
-  // Get graphic regions (images only, no paths)
-  const graphicRegions = await extractGraphicRegions(page, OPS);
+  // Get graphic regions from image operators
+  const opGraphicRegions = await extractGraphicRegions(page, OPS);
 
   // Render full page to offscreen canvas for bitmap extraction
   const renderScale = 2;
@@ -328,7 +518,55 @@ async function analyzePage(page, OPS) {
     viewport: renderViewport,
   }).promise;
 
-  // Build region map (filters overlapping graphics)
+  // Also detect graphics from rendered canvas (catches vector graphics)
+  const renderGraphicRegions = detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale);
+  // Merge op-based and render-based, deduplicating by overlap
+  const graphicRegions = [...opGraphicRegions];
+  for (const rg of renderGraphicRegions) {
+    const overlapsExisting = graphicRegions.some(og => {
+      const ogBbox = og.screenCoords
+        ? og.bbox
+        : { x: og.bbox.x, y: pageHeight - og.bbox.y - og.bbox.h, w: og.bbox.w, h: og.bbox.h };
+      return bboxOverlap(rg.bbox, ogBbox) > 0.3;
+    });
+    if (!overlapsExisting) graphicRegions.push(rg);
+  }
+
+  // Visual bold detection: sample pixel darkness per block from offscreen render
+  const darknesses = [];
+  for (const block of textBlocks) {
+    const sx = Math.floor(block.bbox.x * renderScale);
+    const sy = Math.floor((block.bbox.y + block.bbox.h * 0.2) * renderScale);
+    const sw = Math.min(Math.floor(block.bbox.w * renderScale), offCanvas.width - sx);
+    const sh = Math.floor(Math.max(block.avgFontSize * 0.5, 4) * renderScale);
+    if (sw > 0 && sh > 0 && sx >= 0 && sy >= 0 && sy + sh <= offCanvas.height) {
+      const strip = offCtx.getImageData(sx, sy, sw, sh);
+      const px = strip.data;
+      let totalDark = 0, count = 0;
+      for (let k = 0; k < px.length; k += 8) { // sample every other pixel
+        if (px[k + 3] > 128) {
+          totalDark += 255 - (0.299 * px[k] + 0.587 * px[k + 1] + 0.114 * px[k + 2]);
+          count++;
+        }
+      }
+      darknesses.push(count > 0 ? totalDark / count : 0);
+    } else {
+      darknesses.push(0);
+    }
+  }
+  // Find median darkness (body text baseline)
+  const validDark = darknesses.filter(d => d > 0).sort((a, b) => a - b);
+  if (validDark.length > 2) {
+    const medianDark = validDark[Math.floor(validDark.length / 2)];
+    for (let i = 0; i < textBlocks.length; i++) {
+      // Override bold if visual weight is significantly above median
+      if (darknesses[i] > medianDark * 1.25 && !textBlocks[i].isBold) {
+        textBlocks[i].isBold = true;
+      }
+    }
+  }
+
+  // Build region map (filters overlapping graphics, detects columns + alignment)
   const regionMap = buildRegionMap(textBlocks, graphicRegions, pageHeight);
 
   // Extract bitmap snippets for graphic regions only
@@ -413,6 +651,7 @@ function reflowAndComposite(analysis, opts) {
         fontStyle: style,
         fontWeight: weight,
         fontFamily: blockFamily,
+        align: block.align || "left",
         region,
       });
     } else {
@@ -496,11 +735,18 @@ function drawComposite(ctx, reflowedRegions, analysis, opts, scrollY) {
 
       ctx.fillStyle = textColor;
       ctx.font = `${style} ${weight} ${fs * d}px ${fontFamily}`;
+      const centered = r.align === "center";
 
       for (const line of r.lines) {
         const screenY = cursorY - scrollY;
         if (screenY > -lh && screenY < canvasH + lh) {
-          ctx.fillText(line.text, padding * d, screenY * d);
+          if (centered) {
+            ctx.textAlign = "center";
+            ctx.fillText(line.text, (canvasW / 2) * d, screenY * d);
+            ctx.textAlign = "left";
+          } else {
+            ctx.fillText(line.text, padding * d, screenY * d);
+          }
         }
         cursorY += lh;
       }
@@ -634,11 +880,18 @@ export function createReflowRenderer(container, options = {}) {
         const rFamily = r.fontFamily || fontFamily;
         ctx.fillStyle = textColor;
         ctx.font = `${r.fontStyle || "normal"} ${r.fontWeight || 400} ${fs * d}px ${rFamily}`;
+        const centered = r.align === "center";
 
         for (const line of r.lines) {
           const screenY = cursorY - scrollY;
           if (screenY > -lh && screenY < H + lh) {
-            ctx.fillText(line.text, padding * d, screenY * d);
+            if (centered) {
+              ctx.textAlign = "center";
+              ctx.fillText(line.text, (W / 2) * d, screenY * d);
+              ctx.textAlign = "left";
+            } else {
+              ctx.fillText(line.text, padding * d, screenY * d);
+            }
           }
           cursorY += lh;
         }
@@ -789,6 +1042,7 @@ export function createReflowRenderer(container, options = {}) {
       scrollY = 0;
       scrollVelocity = 0;
       reflow();
+      onZoom?.(fontSize);
 
       onPageReady?.({
         pageNum,
@@ -838,6 +1092,7 @@ export function createReflowRenderer(container, options = {}) {
       scrollY = 0;
       scrollVelocity = 0;
       reflow();
+      onZoom?.(fontSize);
     },
 
     async nextPage() {
