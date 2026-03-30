@@ -74,10 +74,10 @@ function groupTextBlocks(textItems, pageHeight, styles) {
     const sizeOk = sizeRatio < 1.3 || isSuperscript;
 
     // Large horizontal gap between consecutive items → likely column break
-    // Positive gap: item far right of last item (left→right column jump)
-    // Negative position: item far left of block start (right→left column jump)
-    if (hGap > lastFH * 1.5 ||
-        (current.bbox.w > lastFH * 10 && x < current.bbox.x - lastFH * 3)) {
+    // Only for substantive text (skip short items like superscript markers)
+    const isLongItem = (item.str || "").trim().length > 3;
+    if (isLongItem && (hGap > lastFH * 1.5 ||
+        (current.bbox.w > lastFH * 10 && x < current.bbox.x - lastFH * 3))) {
       blocks.push(current);
       current = { items: [item], bbox: { x, y, w: item.width || 0, h: fontHeight } };
       continue;
@@ -114,11 +114,14 @@ function groupTextBlocks(textItems, pageHeight, styles) {
 
     let bestIdx = -1, bestDist = Infinity;
     for (let j = 0; j < blocks.length; j++) {
-      if (j === i || blocks[j].items.length <= 1) continue;
+      if (j === i) continue;
       const o = blocks[j];
-      // Check vertical proximity: block center within other's vertical extent + margin
+      // Skip other orphans (short text blocks)
+      const oText = o.items.map(it => (it.str || "").trim()).join("");
+      if (oText.length <= 3) continue;
+      // Check vertical proximity: orphan center within 30pt of target block
       const bcy = block.bbox.y + block.bbox.h / 2;
-      if (bcy < o.bbox.y - o.bbox.h * 0.5 || bcy > o.bbox.y + o.bbox.h * 1.5) continue;
+      if (bcy < o.bbox.y - 30 || bcy > o.bbox.y + o.bbox.h + 30) continue;
       // Horizontal edge-to-edge distance (0 if overlapping)
       const hDist = Math.max(0,
         block.bbox.x > o.bbox.x + o.bbox.w ? block.bbox.x - (o.bbox.x + o.bbox.w) :
@@ -129,7 +132,7 @@ function groupTextBlocks(textItems, pageHeight, styles) {
       }
     }
 
-    if (bestIdx >= 0 && bestDist < (blocks[bestIdx].bbox.h || 20)) {
+    if (bestIdx >= 0 && bestDist < Math.max(blocks[bestIdx].bbox.h, 20)) {
       const target = blocks[bestIdx];
       target.items.push(...block.items);
       const newX = Math.min(target.bbox.x, block.bbox.x);
@@ -350,7 +353,8 @@ function blockToText(block, pageHeight) {
 
     if (lastY !== null) {
       const gap = Math.abs(currentY - lastY);
-      if (gap > lastFontSize * 1.8) {
+      const isShortItem = (item.str || "").trim().length <= 2;
+      if (gap > lastFontSize * 1.8 && !isShortItem) {
         result += "\n\n";
       } else if (gap > lastFontSize * 0.3) {
         if (!result.endsWith(" ") && !result.endsWith("\n")) {
@@ -530,40 +534,6 @@ async function analyzePage(page, OPS) {
       return bboxOverlap(rg.bbox, ogBbox) > 0.3;
     });
     if (!overlapsExisting) graphicRegions.push(rg);
-  }
-
-  // Visual bold detection: sample pixel darkness per block from offscreen render
-  const darknesses = [];
-  for (const block of textBlocks) {
-    const sx = Math.floor(block.bbox.x * renderScale);
-    const sy = Math.floor((block.bbox.y + block.bbox.h * 0.2) * renderScale);
-    const sw = Math.min(Math.floor(block.bbox.w * renderScale), offCanvas.width - sx);
-    const sh = Math.floor(Math.max(block.avgFontSize * 0.5, 4) * renderScale);
-    if (sw > 0 && sh > 0 && sx >= 0 && sy >= 0 && sy + sh <= offCanvas.height) {
-      const strip = offCtx.getImageData(sx, sy, sw, sh);
-      const px = strip.data;
-      let totalDark = 0, count = 0;
-      for (let k = 0; k < px.length; k += 8) { // sample every other pixel
-        if (px[k + 3] > 128) {
-          totalDark += 255 - (0.299 * px[k] + 0.587 * px[k + 1] + 0.114 * px[k + 2]);
-          count++;
-        }
-      }
-      darknesses.push(count > 0 ? totalDark / count : 0);
-    } else {
-      darknesses.push(0);
-    }
-  }
-  // Find median darkness (body text baseline)
-  const validDark = darknesses.filter(d => d > 0).sort((a, b) => a - b);
-  if (validDark.length > 2) {
-    const medianDark = validDark[Math.floor(validDark.length / 2)];
-    for (let i = 0; i < textBlocks.length; i++) {
-      // Override bold if visual weight is significantly above median
-      if (darknesses[i] > medianDark * 1.25 && !textBlocks[i].isBold) {
-        textBlocks[i].isBold = true;
-      }
-    }
   }
 
   // Build region map (filters overlapping graphics, detects columns + alignment)
