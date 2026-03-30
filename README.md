@@ -1,6 +1,8 @@
 # pretext-pdfjs
 
-A Pretext-powered text layer for PDF.js. Pinch to zoom text, not the page.
+Pretext-native text layer for PDF.js.
+
+*Use PDF.js for parsing and rendering. Use pretext-pdfjs for the text layer.*
 
 **[Live Demo →](https://pretext-pdfjs.surge.sh)** · **[npm](https://www.npmjs.com/package/pretext-pdfjs)**
 
@@ -8,9 +10,9 @@ A Pretext-powered text layer for PDF.js. Pinch to zoom text, not the page.
 
 ## What this is
 
-PDF.js renders PDFs using three layers: a **parser**, a **canvas renderer**, and a **text layer** (invisible DOM spans for selection/search). This library replaces the text layer with one built on [@chenglou/pretext](https://github.com/chenglou/pretext)'s zero-reflow measurement engine, and adds [pinch-type](https://github.com/lucascrespo23/pinch-type) reading modes.
+PDF.js has no plugin system — but its layered API means you can use the parser and canvas renderer while bringing your own text layer. That's what this library does.
 
-1,528 lines. Not a fork — a wrapper.
+pretext-pdfjs replaces the text layer with one built on [@chenglou/pretext](https://github.com/chenglou/pretext)'s zero-reflow measurement engine, and adds [pinch-type](https://github.com/lucascrespo23/pinch-type) reading modes. 1,528 lines. Not a fork — a companion library.
 
 ## Why
 
