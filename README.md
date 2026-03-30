@@ -86,6 +86,53 @@ await TextLayer.enableReflow(container, fullText, {
 });
 ```
 
+### Per-block reflow (images + text)
+
+The reflow module bridges PDF mode (images preserved, no reflow) and reader modes (text reflows, images stripped). Text blocks reflow with Pretext at the target font size while images and vector graphics render as scaled bitmaps in their original positions.
+
+```js
+import { createReflowRenderer } from "pretext-pdfjs/reflow";
+
+const renderer = createReflowRenderer(container, {
+  fontSize: 16,
+  fontFamily: '"Literata", Georgia, serif',
+  lineHeight: 1.6,
+  padding: 24,
+  background: "#f4f1eb",
+  textColor: "#252320",
+  imageFit: "proportional",  // "proportional" | "original" | "full-width"
+  enablePinchZoom: true,
+  enableMomentumScroll: true,
+  onZoom: (fontSize) => console.log("Font size:", fontSize),
+  onPageReady: ({ pageNum, textBlocks, graphicRegions }) => {
+    console.log(`Page ${pageNum}: ${textBlocks.length} text blocks, ${graphicRegions.length} graphics`);
+  },
+});
+
+await renderer.open("document.pdf");
+await renderer.showPage(1);        // single page
+// or: await renderer.showAll();   // all pages concatenated
+
+renderer.nextPage();
+renderer.prevPage();
+
+// Read-only properties
+renderer.currentPage;   // number
+renderer.numPages;       // number
+renderer.canvas;         // HTMLCanvasElement
+renderer.regions;        // { text: [...], graphic: [...] }
+
+renderer.destroy();
+```
+
+**How it works:**
+
+1. **Analyze** — extracts text blocks (grouped by proximity) and graphic regions (images, vector paths) from the PDF page via `getTextContent()` and `getOperatorList()`. Renders the full page to an offscreen canvas and captures bitmap snippets for each graphic region.
+2. **Reflow** — each text block is reflowed with Pretext's `prepareWithSegments()` + `layoutWithLines()` at the current font size. Graphic bitmaps are scaled proportionally.
+3. **Composite** — walks the region map in reading order, drawing reflowed text lines and graphic bitmaps onto a single output canvas.
+
+Steps 1 runs once per page (cached). Steps 2-3 re-run on font size change, which is what makes pinch-to-zoom fast.
+
 ## Architecture
 
 ```
@@ -95,7 +142,8 @@ pretext-pdfjs/
 │   ├── pretext-text-layer.js     # PretextTextLayer (drop-in replacement)
 │   ├── measurement-cache.js      # Pretext-style Canvas measurement cache
 │   ├── viewer.js                 # PretextPDFViewer helper
-│   └── pinch.js                  # Pinch-type PDF reader integration
+│   ├── pinch.js                  # Pinch-type PDF reader integration
+│   └── reflow.js                 # Per-block reflow (text + images)
 ├── demo.html                     # Self-contained demo page
 ├── package.json
 └── README.md
@@ -105,7 +153,7 @@ pretext-pdfjs/
 
 **Replaced**: `TextLayer` class — measurement cache, ascent detection, width scaling.
 
-**Added**: `pretextMetrics`, `enableReflow()`, pinch/morph/combined reading modes.
+**Added**: `pretextMetrics`, `enableReflow()`, pinch/morph/combined reading modes, per-block reflow with image preservation.
 
 ## Built on
 

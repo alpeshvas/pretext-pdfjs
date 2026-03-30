@@ -65,3 +65,6 @@ export {
   PretextMeasurementCache,
   pretextCache,
 } from "./pretext-text-layer.js";
+
+// Reflow renderer
+export { createReflowRenderer } from "./reflow.js";
