@@ -14,6 +14,25 @@ function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
+/**
+ * Draw a line of text with justified spacing (equal space between words).
+ */
+function drawJustifiedLine(ctx, text, x, y, availWidth) {
+  const words = text.split(" ");
+  if (words.length <= 1) {
+    ctx.fillText(text, x, y);
+    return;
+  }
+  let totalWordWidth = 0;
+  for (const w of words) totalWordWidth += ctx.measureText(w).width;
+  const extraSpace = (availWidth - totalWordWidth) / (words.length - 1);
+  let xPos = x;
+  for (const w of words) {
+    ctx.fillText(w, xPos, y);
+    xPos += ctx.measureText(w).width + extraSpace;
+  }
+}
+
 function bboxOverlap(a, b) {
   const x1 = Math.max(a.x, b.x);
   const y1 = Math.max(a.y, b.y);
@@ -25,13 +44,49 @@ function bboxOverlap(a, b) {
   return smaller > 0 ? intersection / smaller : 0;
 }
 
+// ─── Font metadata extraction ────────────────────────────────────────────
+
+/**
+ * Extract real font metadata (bold, italic, weight, loadedName) from
+ * page.commonObjs. Must be called AFTER page.render() so fonts are loaded.
+ */
+async function extractFontMetadata(page, opList, OPS) {
+  const fontMap = new Map();
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    if (opList.fnArray[i] === OPS.setFont) {
+      const fontRefName = opList.argsArray[i][0];
+      if (fontMap.has(fontRefName)) continue;
+
+      try {
+        const fontObj = page.commonObjs.get(fontRefName);
+        if (fontObj) {
+          fontMap.set(fontRefName, {
+            bold: fontObj.bold || false,
+            black: fontObj.black || false,
+            italic: fontObj.italic || false,
+            loadedName: fontObj.loadedName || null,
+            fallbackName: fontObj.fallbackName || "sans-serif",
+            css: fontObj.systemFontInfo?.css || null,
+            isMonospace: fontObj.isMonospace || false,
+            isSerifFont: fontObj.isSerifFont || false,
+          });
+        }
+      } catch (_) {
+        // Font not yet loaded — skip
+      }
+    }
+  }
+  return fontMap;
+}
+
 // ─── Page analysis ────────────────────────────────────────────────────────
 
 /**
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles) {
+function groupTextBlocks(textItems, pageHeight, styles, fontMap) {
   const sorted = [...textItems].filter(i => i.str?.trim()).sort((a, b) => {
     const ay = pageHeight - a.transform[5];
     const by = pageHeight - b.transform[5];
@@ -145,7 +200,7 @@ function groupTextBlocks(textItems, pageHeight, styles) {
     }
   }
 
-  // Compute font metadata per block
+  // Compute font metadata per block using real font objects from commonObjs
   for (const block of blocks) {
     const sizes = [];
     let italicCount = 0;
@@ -155,18 +210,10 @@ function groupTextBlocks(textItems, pageHeight, styles) {
       const fh = Math.hypot(item.transform[2], item.transform[3]);
       if (fh > 0) sizes.push(fh);
 
-      // Detect italic/bold from fontName and style
-      const name = (item.fontName || "").toLowerCase();
-      const style = styles?.[item.fontName];
-      const family = (style?.fontFamily || "").toLowerCase();
-      const combined = name + " " + family;
-
-      if (combined.includes("italic") || combined.includes("oblique")) italicCount++;
-      if (combined.includes("bold") || combined.includes("black") || combined.includes("heavy")) boldCount++;
-
-      // Also detect italic from transform skew
-      if (Math.abs(item.transform[2]) > 0.1 && Math.abs(item.transform[1]) < 0.1) {
-        italicCount++;
+      const fontMeta = fontMap?.get(item.fontName);
+      if (fontMeta) {
+        if (fontMeta.italic) italicCount++;
+        if (fontMeta.bold || fontMeta.black) boldCount++;
       }
     }
 
@@ -175,10 +222,10 @@ function groupTextBlocks(textItems, pageHeight, styles) {
       : 12;
     block.isItalic = italicCount > block.items.length * 0.4;
     block.isBold = boldCount > block.items.length * 0.4;
+    block.isBlack = block.items.some(it => fontMap?.get(it.fontName)?.black);
 
-    // Detect font family from the PDF's style metadata
-    const sampleStyle = styles?.[block.items[0]?.fontName];
-    block.pdfFontFamily = sampleStyle?.fontFamily || null;
+    // Store the font metadata for the dominant font in this block
+    block.fontMeta = fontMap?.get(block.items[0]?.fontName) || null;
   }
 
   return blocks;
@@ -434,15 +481,51 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
     }
   }
 
-  // ── Detect text alignment per block ──
+  // ── Detect text alignment per block (including justified) ──
   for (const region of regions) {
     if (region.type !== "text") continue;
     const block = region.block;
     const leftMargin = block.bbox.x;
     const rightMargin = pageWidth - (block.bbox.x + block.bbox.w);
     const marginDiff = Math.abs(leftMargin - rightMargin);
+
+    // Detect justified text: multiple lines with consistent right edges
+    let isJustified = false;
+    if (block.items.length >= 3) {
+      const lines = [];
+      let lineItems = [];
+      let lastLineY = null;
+      for (const item of block.items) {
+        const y = pageHeight - item.transform[5];
+        if (lastLineY !== null && Math.abs(y - lastLineY) > 2) {
+          if (lineItems.length > 0) lines.push(lineItems);
+          lineItems = [];
+        }
+        lineItems.push(item);
+        lastLineY = y;
+      }
+      if (lineItems.length > 0) lines.push(lineItems);
+
+      if (lines.length >= 3) {
+        // Compute right edge of each line (except last — last line is usually ragged)
+        const rightEdges = [];
+        for (let li = 0; li < lines.length - 1; li++) {
+          const lastItem = lines[li][lines[li].length - 1];
+          const rightX = lastItem.transform[4] + (lastItem.width || 0);
+          rightEdges.push(rightX);
+        }
+        if (rightEdges.length >= 2) {
+          const maxRight = Math.max(...rightEdges);
+          const consistent = rightEdges.filter(r => Math.abs(r - maxRight) < pageWidth * 0.02);
+          isJustified = consistent.length > rightEdges.length * 0.7;
+        }
+      }
+    }
+
     if (hasColumns && block.bbox.w <= pageWidth * 0.6) {
-      block.align = "left"; // column blocks are always left-aligned
+      block.align = isJustified ? "justify" : "left";
+    } else if (isJustified) {
+      block.align = "justify";
     } else if (leftMargin > pageWidth * 0.05 && marginDiff < pageWidth * 0.1) {
       block.align = "center";
     } else {
@@ -489,23 +572,8 @@ async function analyzePage(page, OPS) {
 
   // Get text content with styles
   const textContent = await page.getTextContent();
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles);
 
-  // Compute body font size (most common size = body text)
-  const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
-  const freq = {};
-  for (const s of allSizes) freq[s] = (freq[s] || 0) + 1;
-  let bodyFontSize = 12;
-  let maxFreq = 0;
-  for (const [s, f] of Object.entries(freq)) {
-    if (f > maxFreq) { maxFreq = f; bodyFontSize = parseFloat(s); }
-  }
-  // Compute fontScale per block
-  for (const block of textBlocks) {
-    block.fontScale = block.avgFontSize / bodyFontSize;
-  }
-
-  // Get operator list once (reused for text/non-text classification + image extraction)
+  // Get operator list once (reused for text/non-text classification + image extraction + font metadata)
   const opList = await page.getOperatorList();
 
   // Identify text operation indices for operationsFilter
@@ -535,8 +603,10 @@ async function analyzePage(page, OPS) {
     operationsFilter: (index) => !textOpIndices.has(index),
   }).promise;
 
-  // Get precise image coordinates via recordImages (supplements CTM detection)
+  // Get precise image coordinates via recordImages (supplements CTM detection).
+  // This full render also loads fonts into commonObjs as a side effect.
   let imageCoordRegions = [];
+  let fullRenderDone = false;
   try {
     const imgTrackCanvas = document.createElement("canvas");
     imgTrackCanvas.width = offCanvas.width;
@@ -547,6 +617,7 @@ async function analyzePage(page, OPS) {
       recordImages: true,
     });
     await imgRenderTask.promise;
+    fullRenderDone = true;
     const imageCoords = imgRenderTask.imageCoordinates;
     if (imageCoords && imageCoords.length > 0) {
       for (let j = 0; j < imageCoords.length; j += 6) {
@@ -570,6 +641,38 @@ async function analyzePage(page, OPS) {
     }
   } catch (_) {
     // recordImages not supported — CTM fallback is used
+  }
+
+  // Ensure fonts are loaded for commonObjs access. If the recordImages render
+  // above didn't run, do a minimal full render to trigger font loading.
+  if (!fullRenderDone) {
+    const fontCanvas = document.createElement("canvas");
+    fontCanvas.width = 1;
+    fontCanvas.height = 1;
+    const fontViewport = page.getViewport({ scale: 0.1 });
+    try {
+      await page.render({ canvasContext: fontCanvas.getContext("2d"), viewport: fontViewport }).promise;
+    } catch (_) {}
+  }
+
+  // Extract real font metadata from commonObjs (bold, italic, weight, loadedName)
+  const fontMap = await extractFontMetadata(page, opList, OPS);
+
+  // Now group text blocks with real font data
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap);
+
+  // Compute body font size (most common size = body text)
+  const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
+  const freq = {};
+  for (const s of allSizes) freq[s] = (freq[s] || 0) + 1;
+  let bodyFontSize = 12;
+  let maxFreq = 0;
+  for (const [s, f] of Object.entries(freq)) {
+    if (f > maxFreq) { maxFreq = f; bodyFontSize = parseFloat(s); }
+  }
+  // Compute fontScale per block
+  for (const block of textBlocks) {
+    block.fontScale = block.avgFontSize / bodyFontSize;
   }
 
   // Detect graphics from rendered non-text canvas (catches vector graphics)
@@ -613,13 +716,14 @@ async function analyzePage(page, OPS) {
     textBlocks,
     graphicRegions,
     offCanvas,
+    fontMap,
   };
 }
 
 // ─── Reflow + composite engine ────────────────────────────────────────────
 
 function reflowAndComposite(analysis, opts) {
-  const { regionMap, bitmaps, pageWidth, pageHeight } = analysis;
+  const { regionMap, bitmaps, pageWidth, pageHeight, fontMap } = analysis;
   const {
     fontSize, fontFamily, lineHeight, padding, background,
     textColor, imageFit, canvasW,
@@ -648,15 +752,22 @@ function reflowAndComposite(analysis, opts) {
         continue;
       }
 
-      // Per-block font properties
+      // Per-block font properties using real font metadata from commonObjs
       const blockFontSize = Math.round(fontSize * (block.fontScale || 1));
       const blockLH = blockFontSize * lineHeight;
+      const fm = block.fontMeta;
       const style = block.isItalic ? "italic" : "normal";
-      const weight = block.isBold ? 700 : 400;
-      // Use PDF's detected font family if available, otherwise fall back to configured
-      const blockFamily = block.pdfFontFamily
-        ? `${block.pdfFontFamily}, ${fontFamily}`
-        : fontFamily;
+      const weight = block.isBlack ? 900 : block.isBold ? 700 : 400;
+
+      // Use the actual embedded PDF font if available (PDF.js loaded it via @font-face)
+      let blockFamily;
+      if (fm?.loadedName) {
+        blockFamily = `"${fm.loadedName}", ${fm.fallbackName || "sans-serif"}`;
+      } else if (fm?.css) {
+        blockFamily = fm.css;
+      } else {
+        blockFamily = fontFamily;
+      }
       const font = `${style} ${weight} ${blockFontSize}px ${blockFamily}`;
 
       const prepared = prepareWithSegments(text, font);
@@ -832,15 +943,22 @@ export function createReflowRenderer(container, options = {}) {
         const style = r.fontStyle || "normal";
         const weight = r.fontWeight || 400;
         const centered = r.align === "center";
+        const justified = r.align === "justify";
+        const availW = W - padding * 2;
 
         if (!enableMorph) {
           ctx.fillStyle = textColor;
           ctx.font = `${style} ${weight} ${fs * d}px ${rFamily}`;
         }
 
-        for (const line of r.lines) {
+        for (let lineIdx = 0; lineIdx < r.lines.length; lineIdx++) {
+          const line = r.lines[lineIdx];
           const screenY = cursorY - scrollY;
           if (screenY > -lh && screenY < H + lh) {
+            // Justified: distribute extra space between words (not on last line)
+            const isLastLine = lineIdx === r.lines.length - 1;
+            const shouldJustify = justified && !isLastLine && line.text.includes(" ");
+
             if (enableMorph) {
               const dist = Math.abs(screenY - viewCenter);
               const t = Math.min(dist / morphRadius, 1);
@@ -856,6 +974,8 @@ export function createReflowRenderer(container, options = {}) {
                 ctx.textAlign = "center";
                 ctx.fillText(line.text, (W / 2) * d, screenY * d);
                 ctx.textAlign = "left";
+              } else if (shouldJustify) {
+                drawJustifiedLine(ctx, line.text, padding * d, screenY * d, availW * d);
               } else {
                 ctx.fillText(line.text, padding * d, screenY * d);
               }
@@ -865,6 +985,8 @@ export function createReflowRenderer(container, options = {}) {
                 ctx.textAlign = "center";
                 ctx.fillText(line.text, (W / 2) * d, screenY * d);
                 ctx.textAlign = "left";
+              } else if (shouldJustify) {
+                drawJustifiedLine(ctx, line.text, padding * d, screenY * d, availW * d);
               } else {
                 ctx.fillText(line.text, padding * d, screenY * d);
               }
