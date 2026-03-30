@@ -1,7 +1,7 @@
 {
   "name": "pretext-pdfjs",
-  "version": "0.1.0",
-  "description": "Fork of PDF.js with @chenglou/pretext-native text layer — zero DOM reflows for text measurement",
+  "version": "0.2.1",
+  "description": "Pretext-native text layer for PDF.js — zero DOM reflows, per-block reflow with image preservation, pinch-to-zoom text",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -9,7 +9,8 @@
     "./text-layer": "./src/pretext-text-layer.js",
     "./measurement-cache": "./src/measurement-cache.js",
     "./viewer": "./src/viewer.js",
-    "./pinch": "./src/pinch.js"
+    "./pinch": "./src/pinch.js",
+    "./reflow": "./src/reflow.js"
   },
   "files": [
     "src/",

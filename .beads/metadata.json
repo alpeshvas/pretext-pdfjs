@@ -1,0 +1,8 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_port": 18782,
+  "dolt_database": "pretext_pdfjs",
+  "project_id": "78c98741-c0a4-42ed-91a6-dc33f166825d"
+}

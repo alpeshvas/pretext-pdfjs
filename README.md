@@ -86,6 +86,90 @@ await TextLayer.enableReflow(container, fullText, {
 });
 ```
 
+### Reflow Mode (images preserved)
+
+```js
+import { createReflowRenderer } from "pretext-pdfjs/reflow";
+
+const renderer = createReflowRenderer(container, {
+  fontSize: 16,
+  enablePinchZoom: true,
+  enableMorph: false,           // set true for fisheye scroll
+  fontFamily: '"Literata", Georgia, serif',
+});
+await renderer.open("document.pdf");
+await renderer.showPage(1);
+// Pinch to zoom — text reflows, images stay in place
+```
+
+Unlike the text-only reader modes, reflow mode preserves images, vector graphics,
+and document structure. It uses PDF.js's `operationsFilter` to render non-text
+elements separately, then composites Pretext-reflowed text on top.
+
+### Pinch reader with preserved layout
+
+```js
+import { createPDFPinchReader } from "pretext-pdfjs/pinch";
+
+const reader = createPDFPinchReader(container, {
+  mode: "pinchType",
+  preserveLayout: true,  // images stay in place
+});
+await reader.open("document.pdf");
+await reader.showPage(1);
+```
+
+### Per-block reflow (full options)
+
+The reflow module bridges PDF mode (images preserved, no reflow) and reader modes (text reflows, images stripped). Text blocks reflow with Pretext at the target font size while images and vector graphics render as scaled bitmaps in their original positions.
+
+```js
+import { createReflowRenderer } from "pretext-pdfjs/reflow";
+
+const renderer = createReflowRenderer(container, {
+  fontSize: 16,
+  fontFamily: '"Literata", Georgia, serif',
+  lineHeight: 1.6,
+  padding: 24,
+  background: "#f4f1eb",
+  textColor: "#252320",
+  imageFit: "proportional",  // "proportional" | "original" | "full-width"
+  maxWidth: Infinity,        // max canvas width (default: full container)
+  enablePinchZoom: true,
+  enableMomentumScroll: true,
+  enableMorph: false,        // fisheye scroll effect on text + images
+  morphRadius: 300,          // morph effect radius in px
+  edgeFontRatio: 0.5,       // edge font = 50% of center font
+  onZoom: (fontSize) => console.log("Font size:", fontSize),
+  onPageReady: ({ pageNum, textBlocks, graphicRegions }) => {
+    console.log(`Page ${pageNum}: ${textBlocks.length} text blocks, ${graphicRegions.length} graphics`);
+  },
+});
+
+await renderer.open("document.pdf");
+await renderer.showPage(1);        // single page
+// or: await renderer.showAll();   // all pages concatenated
+
+renderer.nextPage();
+renderer.prevPage();
+
+// Read-only properties
+renderer.currentPage;   // number
+renderer.numPages;       // number
+renderer.canvas;         // HTMLCanvasElement
+renderer.regions;        // { text: [...], graphic: [...] }
+
+renderer.destroy();
+```
+
+**How it works:**
+
+1. **Analyze** — extracts text blocks (grouped by proximity) and graphic regions (images, vector paths) from the PDF page via `getTextContent()` and `getOperatorList()`. Uses `operationsFilter` to render only non-text content to an offscreen canvas, and `recordImages` for precise image coordinates.
+2. **Reflow** — each text block is reflowed with Pretext's `prepareWithSegments()` + `layoutWithLines()` at the current font size. Graphic bitmaps are scaled proportionally.
+3. **Composite** — walks the region map in reading order, drawing reflowed text lines and graphic bitmaps onto a single output canvas. With `enableMorph`, applies fisheye interpolation to both text and images.
+
+Steps 1 runs once per page (cached). Steps 2-3 re-run on font size change, which is what makes pinch-to-zoom fast.
+
 ## Architecture
 
 ```
@@ -95,17 +179,19 @@ pretext-pdfjs/
 │   ├── pretext-text-layer.js     # PretextTextLayer (drop-in replacement)
 │   ├── measurement-cache.js      # Pretext-style Canvas measurement cache
 │   ├── viewer.js                 # PretextPDFViewer helper
-│   └── pinch.js                  # Pinch-type PDF reader integration
-├── demo.html                     # Self-contained demo page
+│   ├── pinch.js                  # Pinch-type reading modes
+│   └── reflow.js                 # Per-block reflow with image preservation
+├── demo.html                     # Library landing page
+├── reader.html                   # Full PDF reader demo
 ├── package.json
 └── README.md
 ```
 
-**Kept from PDF.js** (via `pdfjs-dist` dependency): core parser, canvas renderer, annotation layer, worker architecture, font loading.
+**Kept from PDF.js**: core parser, canvas renderer, annotation layer, worker, font loading.
 
-**Replaced**: `TextLayer` class — measurement cache, ascent detection, width scaling.
+**Replaced**: TextLayer — measurement cache, ascent detection, width scaling.
 
-**Added**: `pretextMetrics`, `enableReflow()`, pinch/morph/combined reading modes.
+**Added**: pretextMetrics, enableReflow(), pinch/morph reading modes, per-block reflow with image preservation.
 
 ## Built on
 
