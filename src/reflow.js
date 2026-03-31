@@ -64,7 +64,7 @@ function drawColoredLine(ctx, text, charOffset, spans, defaultColor, x, y) {
     }
 
     const spanText = text.slice(overlapStart, overlapEnd);
-    ctx.fillStyle = span.color;
+    ctx.fillStyle = span.color === "transparent" ? defaultColor : span.color;
     ctx.fillText(spanText, xPos, y);
     xPos += ctx.measureText(spanText).width;
     pos = overlapEnd;
@@ -156,57 +156,50 @@ async function extractFontMetadata(page, opList, OPS) {
 // ─── Text color extraction ───────────────────────────────────────────────
 
 /**
- * Extract fill colors per beginText/endText block pair.
+ * Extract visible text colors per beginText/endText block pair.
  * Returns an array of color strings, one per text block.
  *
- * The previous approach pushed one color per text-drawing operator (showText,
- * showSpacedText, etc.) and tried to index into text items 1:1. That mapping
- * is broken because a single showSpacedText operator can produce multiple text
- * items via buildTextContentItem(). Instead, we track color at text-block
- * boundaries — all text items within the same beginText/endText pair share
- * the same color context.
+ * Tracks both fill and stroke colors plus text rendering mode to determine
+ * the actual visible color. PDF.js normalizes all color operators to
+ * setFillRGBColor / setStrokeRGBColor (hex strings), so those are the only
+ * color ops that appear in the final operator list.
+ *
+ * Text rendering modes (lower 2 bits):
+ *   0 = fill, 1 = stroke, 2 = fill+stroke, 3 = invisible
+ * For stroke-only text (mode 1), we use the stroke color.
+ * For invisible text (mode 3), we fall back to "#000000".
  */
 function extractTextBlockColors(opList, OPS) {
   const blockColors = []; // one entry per beginText/endText pair
-  let currentColor = "#000000";
+  let fillColor = "#000000";
+  let strokeColor = "#000000";
+  let textRenderingMode = 0; // default: fill
   let blockColor = "#000000";
   let inTextBlock = false;
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
 
-    // Track color changes
     if (fn === OPS.setFillRGBColor) {
-      currentColor = opList.argsArray[i][0];
-    } else if (fn === OPS.setFillTransparent) {
-      currentColor = "transparent";
-    } else if (
-      fn === OPS.setFillGray ||
-      fn === OPS.setFillColor ||
-      fn === OPS.setFillCMYKColor ||
-      fn === OPS.setFillColorN
-    ) {
-      const args = opList.argsArray[i];
-      if (args?.[0] && typeof args[0] === "string" && args[0].startsWith("#")) {
-        currentColor = args[0];
-      }
+      fillColor = argsToHex(opList.argsArray[i]);
+    } else if (fn === OPS.setStrokeRGBColor) {
+      strokeColor = argsToHex(opList.argsArray[i]);
+    } else if (fn === OPS.setTextRenderingMode) {
+      textRenderingMode = opList.argsArray[i][0];
     }
 
     if (fn === OPS.beginText) {
       inTextBlock = true;
-      blockColor = currentColor; // color at start of block
+      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
     }
 
-    // If color changes within a text block, update (last color wins)
+    // If color or rendering mode changes within a text block, update
     if (inTextBlock && (
       fn === OPS.setFillRGBColor ||
-      fn === OPS.setFillTransparent ||
-      fn === OPS.setFillGray ||
-      fn === OPS.setFillColor ||
-      fn === OPS.setFillCMYKColor ||
-      fn === OPS.setFillColorN
+      fn === OPS.setStrokeRGBColor ||
+      fn === OPS.setTextRenderingMode
     )) {
-      blockColor = currentColor;
+      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
     }
 
     if (fn === OPS.endText) {
@@ -216,6 +209,21 @@ function extractTextBlockColors(opList, OPS) {
   }
 
   return blockColors;
+}
+
+/** Convert color operator args to a hex string. Args may be a hex string or RGB byte array. */
+function argsToHex(args) {
+  if (typeof args[0] === "string" && args[0].startsWith("#")) return args[0];
+  const r = args[0] | 0, g = args[1] | 0, b = args[2] | 0;
+  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
+}
+
+/** Pick the color that will actually be visible based on text rendering mode. */
+function visibleColor(fill, stroke, mode) {
+  const m = mode & 3; // lower 2 bits: 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
+  if (m === 1) return stroke;
+  if (m === 0 || m === 2) return fill;
+  return "#000000"; // mode 3 (invisible) — show as black in reflow
 }
 
 // ─── Page analysis ────────────────────────────────────────────────────────
@@ -408,9 +416,7 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
     const colorFreq = {};
     for (const item of block.items) {
       const c = item._color || "#000000";
-      if (c !== "transparent") {
-        colorFreq[c] = (colorFreq[c] || 0) + 1;
-      }
+      colorFreq[c] = (colorFreq[c] || 0) + 1;
     }
     let dominantColor = "#000000";
     let maxColorFreq = 0;
