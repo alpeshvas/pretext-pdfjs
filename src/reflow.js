@@ -156,12 +156,111 @@ async function extractFontMetadata(page, opList, OPS) {
 // ─── Text color extraction ───────────────────────────────────────────────
 
 /**
+ * Extract text with colors from the operator list.
+ * Returns an array of {text, color} objects that can be matched to getTextContent() items.
+ */
+function extractTextWithColors(opList, OPS) {
+  const textRuns = []; // {text, color}
+  let fillColor = "#000000";
+  let strokeColor = "#000000";
+  let textRenderingMode = 0;
+
+  // Helper to extract text from glyph array
+  function glyphsToText(glyphs) {
+    if (!Array.isArray(glyphs)) return "";
+    return glyphs
+      .filter(g => g && typeof g === "object" && g.unicode)
+      .map(g => g.unicode)
+      .join("");
+  }
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    const args = opList.argsArray[i];
+
+    if (fn === OPS.setFillRGBColor) {
+      fillColor = argsToHex(args);
+    } else if (fn === OPS.setStrokeRGBColor) {
+      strokeColor = argsToHex(args);
+    } else if (fn === OPS.setTextRenderingMode) {
+      textRenderingMode = args[0];
+    } else if (fn === OPS.showText || fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
+      const text = glyphsToText(args[0]);
+      if (text) {
+        textRuns.push({ text, color: visibleColor(fillColor, strokeColor, textRenderingMode) });
+      }
+    } else if (fn === OPS.showSpacedText) {
+      // showSpacedText has an array of [glyphs, spacing, glyphs, spacing, ...]
+      const arr = args[0];
+      if (Array.isArray(arr)) {
+        let combinedText = "";
+        for (let j = 0; j < arr.length; j += 2) {
+          const glyphs = arr[j];
+          if (glyphs) {
+            combinedText += glyphsToText(glyphs);
+          }
+        }
+        if (combinedText) {
+          textRuns.push({ text: combinedText, color: visibleColor(fillColor, strokeColor, textRenderingMode) });
+        }
+      }
+    }
+  }
+
+  return textRuns;
+}
+
+/**
+ * Match text items to colors by content.
+ * Returns an array of colors aligned with textItems.
+ */
+function matchColorsToTextItems(textItems, textRuns) {
+  const colors = [];
+  let runIdx = 0;
+
+  for (const item of textItems) {
+    if (item.str === undefined || !item.str.trim()) {
+      colors.push(null); // Skip non-text items
+      continue;
+    }
+
+    const itemText = item.str.trim();
+    let matchedColor = "#000000"; // default
+
+    // Find a text run that matches this item
+    // Reset runIdx if we've gone too far (item may be earlier in the list)
+    if (runIdx >= textRuns.length) {
+      runIdx = 0;
+    }
+
+    // Search for matching run starting from current position
+    for (let i = runIdx; i < textRuns.length; i++) {
+      const run = textRuns[i];
+      const runText = run.text.trim();
+
+      // Skip empty runs
+      if (!runText) continue;
+
+      // Check for exact match or substring match
+      if (runText === itemText || 
+          itemText.startsWith(runText) || 
+          runText.startsWith(itemText)) {
+        matchedColor = run.color;
+        runIdx = i + 1; // Start from next run for next item
+        break;
+      }
+    }
+
+    colors.push(matchedColor);
+  }
+
+  return colors;
+}
+
+/**
  * Extract one visible color per text-drawing operator in the operator list.
  * Returns an array that maps ~1:1 to the text items from getTextContent().
- *
- * Tracks fill/stroke colors and text rendering mode to pick the actual
- * visible color. For showSpacedText, expands one color per string element
- * since each can produce a separate text item.
+ * DEPRECATED: Use extractTextWithColors + matchColorsToTextItems instead.
  */
 function extractTextItemColors(opList, OPS) {
   const itemColors = []; // one entry per text-drawing operator
@@ -237,21 +336,15 @@ function findBlockThreshold(gaps, fontSize) {
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles, fontMap, itemColors) {
-  // Assign per-item colors directly by index — itemColors has one entry
-  // per text-drawing operator, which maps ~1:1 to text items.
-  if (itemColors && itemColors.length > 0) {
-    const realItems = textItems.filter(i => i.str !== undefined);
-    console.log('[reflow-debug-v3] itemColors:', itemColors.length, 'textItems:', realItems.length);
-    // Show first 15 items with their assigned color index
-    const preview = realItems.slice(0, 15).map((it, idx) => `[${idx}] "${it.str.slice(0,25)}" font=${it.fontName}`);
-    console.log('[reflow-debug-v3] items:', JSON.stringify(preview));
-    console.log('[reflow-debug-v3] colors[0..14]:', JSON.stringify(itemColors.slice(0, 15)));
-    let colorIdx = 0;
-    for (const item of textItems) {
-      if (item.str === undefined || !item.str.trim()) continue; // skip marked content, empty & whitespace-only
-      item._color = itemColors[colorIdx] || "#000000";
-      if (colorIdx < itemColors.length - 1) colorIdx++;
+function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
+  // Assign colors to text items by matching content from textRuns.
+  // textRuns is an array of {text, color} extracted from the operator list.
+  if (textRuns && textRuns.length > 0) {
+    const colors = matchColorsToTextItems(textItems, textRuns);
+    for (let i = 0; i < textItems.length; i++) {
+      const item = textItems[i];
+      if (item.str === undefined || !item.str.trim()) continue;
+      item._color = colors[i] || "#000000";
     }
   }
 
@@ -985,11 +1078,11 @@ async function analyzePage(page, OPS) {
   // Extract real font metadata from commonObjs (bold, italic, weight, loadedName)
   const fontMap = await extractFontMetadata(page, opList, OPS);
 
-  // Extract text colors per beginText/endText block (not per operator)
-  const itemColors = extractTextItemColors(opList, OPS);
+  // Extract text with colors from operator list
+  const textRuns = extractTextWithColors(opList, OPS);
 
-  // Now group text blocks with real font data and block colors
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, itemColors);
+  // Now group text blocks with real font data and matched colors
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, textRuns);
 
   // Compute body font size (most common size = body text)
   const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
