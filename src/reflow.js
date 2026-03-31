@@ -156,26 +156,18 @@ async function extractFontMetadata(page, opList, OPS) {
 // ─── Text color extraction ───────────────────────────────────────────────
 
 /**
- * Extract visible text colors per beginText/endText block pair.
- * Returns an array of color strings, one per text block.
+ * Extract one visible color per text-drawing operator in the operator list.
+ * Returns an array that maps ~1:1 to the text items from getTextContent().
  *
- * Tracks both fill and stroke colors plus text rendering mode to determine
- * the actual visible color. PDF.js normalizes all color operators to
- * setFillRGBColor / setStrokeRGBColor (hex strings), so those are the only
- * color ops that appear in the final operator list.
- *
- * Text rendering modes (lower 2 bits):
- *   0 = fill, 1 = stroke, 2 = fill+stroke, 3 = invisible
- * For stroke-only text (mode 1), we use the stroke color.
- * For invisible text (mode 3), we fall back to "#000000".
+ * Tracks fill/stroke colors and text rendering mode to pick the actual
+ * visible color. For showSpacedText, expands one color per string element
+ * since each can produce a separate text item.
  */
-function extractTextBlockColors(opList, OPS) {
-  const blockColors = []; // one entry per beginText/endText pair
+function extractTextItemColors(opList, OPS) {
+  const itemColors = []; // one entry per text-drawing operator
   let fillColor = "#000000";
   let strokeColor = "#000000";
-  let textRenderingMode = 0; // default: fill
-  let blockColor = "#000000";
-  let inTextBlock = false;
+  let textRenderingMode = 0;
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
@@ -186,29 +178,18 @@ function extractTextBlockColors(opList, OPS) {
       strokeColor = argsToHex(opList.argsArray[i]);
     } else if (fn === OPS.setTextRenderingMode) {
       textRenderingMode = opList.argsArray[i][0];
-    }
-
-    if (fn === OPS.beginText) {
-      inTextBlock = true;
-      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
-    }
-
-    // If color or rendering mode changes within a text block, update
-    if (inTextBlock && (
-      fn === OPS.setFillRGBColor ||
-      fn === OPS.setStrokeRGBColor ||
-      fn === OPS.setTextRenderingMode
-    )) {
-      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
-    }
-
-    if (fn === OPS.endText) {
-      blockColors.push(blockColor);
-      inTextBlock = false;
+    } else if (
+      fn === OPS.showText ||
+      fn === OPS.nextLineShowText ||
+      fn === OPS.nextLineSetSpacingShowText
+    ) {
+      itemColors.push(visibleColor(fillColor, strokeColor, textRenderingMode));
+    } else if (fn === OPS.showSpacedText) {
+      itemColors.push(visibleColor(fillColor, strokeColor, textRenderingMode));
     }
   }
 
-  return blockColors;
+  return itemColors;
 }
 
 /** Convert color operator args to a hex string. Args may be a hex string or RGB byte array. */
@@ -232,43 +213,21 @@ function visibleColor(fill, stroke, mode) {
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
-  // Map text items to beginText/endText blocks by detecting position
-  // discontinuities. Items within the same text block are contiguous and
-  // share the same color. When there's a large Y-position jump or font
-  // change, we advance to the next block's color.
-  if (blockColors && blockColors.length > 0) {
-    let blockIdx = 0;
-    let prevY = null;
-    let prevFontName = null;
-    let itemsInCurrentBlock = 0;
-
+function groupTextBlocks(textItems, pageHeight, styles, fontMap, itemColors) {
+  // Assign per-item colors directly by index — itemColors has one entry
+  // per text-drawing operator, which maps ~1:1 to text items.
+  if (itemColors && itemColors.length > 0) {
+    const realItems = textItems.filter(i => i.str !== undefined);
+    console.log('[reflow-debug-v3] itemColors:', itemColors.length, 'textItems:', realItems.length);
+    // Show first 15 items with their assigned color index
+    const preview = realItems.slice(0, 15).map((it, idx) => `[${idx}] "${it.str.slice(0,25)}" font=${it.fontName}`);
+    console.log('[reflow-debug-v3] items:', JSON.stringify(preview));
+    console.log('[reflow-debug-v3] colors[0..14]:', JSON.stringify(itemColors.slice(0, 15)));
+    let colorIdx = 0;
     for (const item of textItems) {
-      if (item.str === undefined) continue; // skip marked content
-
-      const y = item.transform ? item.transform[5] : null;
-      const fontHeight = item.transform
-        ? Math.hypot(item.transform[2], item.transform[3])
-        : 12;
-
-      // Detect text block boundary by position discontinuity
-      if (prevY !== null && y !== null && itemsInCurrentBlock > 0) {
-        const yDiff = Math.abs(y - prevY);
-        const fontChanged = item.fontName !== prevFontName;
-
-        if (
-          (yDiff > fontHeight * 3) ||
-          (fontChanged && yDiff > fontHeight * 0.5)
-        ) {
-          blockIdx = Math.min(blockIdx + 1, blockColors.length - 1);
-          itemsInCurrentBlock = 0;
-        }
-      }
-
-      item._color = blockColors[blockIdx] || "#000000";
-      itemsInCurrentBlock++;
-      prevY = y;
-      prevFontName = item.fontName;
+      if (item.str === undefined || !item.str.trim()) continue; // skip marked content, empty & whitespace-only
+      item._color = itemColors[colorIdx] || "#000000";
+      if (colorIdx < itemColors.length - 1) colorIdx++;
     }
   }
 
@@ -923,10 +882,10 @@ async function analyzePage(page, OPS) {
   const fontMap = await extractFontMetadata(page, opList, OPS);
 
   // Extract text colors per beginText/endText block (not per operator)
-  const blockColors = extractTextBlockColors(opList, OPS);
+  const itemColors = extractTextItemColors(opList, OPS);
 
   // Now group text blocks with real font data and block colors
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, blockColors);
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, itemColors);
 
   // Compute body font size (most common size = body text)
   const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
