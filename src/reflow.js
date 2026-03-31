@@ -25,11 +25,84 @@ function drawJustifiedLine(ctx, text, x, y, availWidth) {
   }
   let totalWordWidth = 0;
   for (const w of words) totalWordWidth += ctx.measureText(w).width;
+
+  const normalSpaceWidth = ctx.measureText(" ").width;
   const extraSpace = (availWidth - totalWordWidth) / (words.length - 1);
+
+  // Fall back to left-aligned if gaps would be too large
+  if (extraSpace > normalSpaceWidth * 3 || totalWordWidth < availWidth * 0.7) {
+    ctx.fillText(text, x, y);
+    return;
+  }
+
   let xPos = x;
   for (const w of words) {
     ctx.fillText(w, xPos, y);
     xPos += ctx.measureText(w).width + extraSpace;
+  }
+}
+
+/**
+ * Draw a line of text with per-span coloring (for inline colored text like links).
+ */
+function drawColoredLine(ctx, text, charOffset, spans, defaultColor, x, y) {
+  const lineStart = charOffset;
+  const lineEnd = charOffset + text.length;
+  let xPos = x;
+  let pos = 0;
+
+  for (const span of spans) {
+    if (span.charEnd <= lineStart || span.charStart >= lineEnd) continue;
+    const overlapStart = Math.max(span.charStart - lineStart, 0);
+    const overlapEnd = Math.min(span.charEnd - lineStart, text.length);
+
+    if (overlapStart > pos) {
+      const gapText = text.slice(pos, overlapStart);
+      ctx.fillStyle = defaultColor;
+      ctx.fillText(gapText, xPos, y);
+      xPos += ctx.measureText(gapText).width;
+    }
+
+    const spanText = text.slice(overlapStart, overlapEnd);
+    ctx.fillStyle = span.color;
+    ctx.fillText(spanText, xPos, y);
+    xPos += ctx.measureText(spanText).width;
+    pos = overlapEnd;
+  }
+
+  if (pos < text.length) {
+    ctx.fillStyle = defaultColor;
+    ctx.fillText(text.slice(pos), xPos, y);
+  }
+}
+
+/**
+ * Draw a line of justified text with per-span coloring.
+ */
+function drawColoredJustifiedLine(ctx, text, charOffset, spans, defaultColor, x, y, availWidth) {
+  const words = text.split(" ");
+  if (words.length <= 1) {
+    drawColoredLine(ctx, text, charOffset, spans, defaultColor, x, y);
+    return;
+  }
+  let totalWordWidth = 0;
+  for (const w of words) totalWordWidth += ctx.measureText(w).width;
+  const normalSpaceWidth = ctx.measureText(" ").width;
+  const extraSpace = (availWidth - totalWordWidth) / (words.length - 1);
+
+  if (extraSpace > normalSpaceWidth * 3 || totalWordWidth < availWidth * 0.7) {
+    drawColoredLine(ctx, text, charOffset, spans, defaultColor, x, y);
+    return;
+  }
+
+  // Draw word by word with per-span coloring and justified spacing
+  let xPos = x;
+  let charPos = 0;
+  for (let wi = 0; wi < words.length; wi++) {
+    const word = words[wi];
+    drawColoredLine(ctx, word, charOffset + charPos, spans, defaultColor, xPos, y);
+    xPos += ctx.measureText(word).width + extraSpace;
+    charPos += word.length + 1; // +1 for space
   }
 }
 
@@ -301,6 +374,29 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textColors) {
       }
     }
     block.color = dominantColor;
+
+    // Build color spans — contiguous runs of items sharing the same color
+    // Character indices map to the concatenated text produced by blockToText
+    block.colorSpans = [];
+    if (block.items.length > 0) {
+      let spanColor = block.items[0]._color || "#000000";
+      let spanCharStart = 0;
+      let charCount = 0;
+
+      for (let i = 0; i < block.items.length; i++) {
+        const c = block.items[i]._color || "#000000";
+        const itemLen = (block.items[i].str || "").length;
+        if (c !== spanColor) {
+          block.colorSpans.push({ charStart: spanCharStart, charEnd: charCount, color: spanColor });
+          spanCharStart = charCount;
+          spanColor = c;
+        }
+        charCount += itemLen;
+        // Account for spaces inserted between items by blockToText
+        if (i < block.items.length - 1) charCount++;
+      }
+      block.colorSpans.push({ charStart: spanCharStart, charEnd: charCount, color: spanColor });
+    }
   }
 
   return blocks;
@@ -649,6 +745,28 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
     });
   }
 
+  // ── Compute inter-block vertical gaps from original PDF layout ──
+  for (let i = 1; i < regions.length; i++) {
+    const prev = regions[i - 1];
+    const curr = regions[i];
+    const prevBottom = prev.bbox.y + prev.bbox.h;
+    const currTop = curr.bbox.y;
+    curr.gapBefore = Math.max(0, currTop - prevBottom);
+  }
+  if (regions.length > 0) {
+    regions[0].gapBefore = regions[0].bbox.y;
+  }
+
+  // Normalize gaps relative to average body line height
+  const bodyBlocks = regions.filter(r =>
+    r.type === "text" && r.block?.fontScale && Math.abs(r.block.fontScale - 1) < 0.15);
+  const avgBodyLH = bodyBlocks.length > 0
+    ? bodyBlocks.reduce((s, r) => s + r.block.avgFontSize * 1.6, 0) / bodyBlocks.length
+    : 12 * 1.6;
+  for (const region of regions) {
+    region.gapRatio = (region.gapBefore || 0) / avgBodyLH;
+  }
+
   return regions;
 }
 
@@ -809,6 +927,7 @@ async function analyzePage(page, OPS) {
     graphicRegions,
     offCanvas,
     fontMap,
+    bodyFontSize,
   };
 }
 
@@ -877,6 +996,7 @@ function reflowAndComposite(analysis, opts) {
         fontFamily: blockFamily,
         align: block.align || "left",
         color: block.color,
+        colorSpans: block.colorSpans || [],
         region,
       });
     } else {
@@ -908,12 +1028,13 @@ function reflowAndComposite(analysis, opts) {
     }
   }
 
-  // Total height
+  // Total height — use original PDF gap ratios between regions
   const baseLH = fontSize * lineHeight;
   let totalHeight = padding;
   for (const r of reflowedRegions) {
     totalHeight += r.height;
-    totalHeight += baseLH * 0.4;
+    const gapRatio = r.region?.gapRatio ?? 0.4;
+    totalHeight += baseLH * Math.max(0.2, Math.min(gapRatio, 2.0));
   }
   totalHeight += padding;
 
@@ -946,6 +1067,7 @@ export function createReflowRenderer(container, options = {}) {
   let pdfjs = null;
   let pdfDoc = null;
   let currentPage = 0;
+  const userSetFontSize = options.fontSize != null;
   let fontSize = options.fontSize ?? 16;
   let destroyed = false;
 
@@ -1050,11 +1172,15 @@ export function createReflowRenderer(container, options = {}) {
         const justified = r.align === "justify";
         const availW = W - padding * 2;
 
+        const hasMultipleColors = r.colorSpans && r.colorSpans.length > 1 &&
+          !r.colorSpans.every(s => s.color === r.colorSpans[0].color);
+
         if (!enableMorph) {
           ctx.fillStyle = r.color || textColor;
           ctx.font = `${style} ${weight} ${fs * d}px ${rFamily}`;
         }
 
+        let lineCharOffset = 0;
         for (let lineIdx = 0; lineIdx < r.lines.length; lineIdx++) {
           const line = r.lines[lineIdx];
           const screenY = cursorY - scrollY;
@@ -1098,6 +1224,21 @@ export function createReflowRenderer(container, options = {}) {
                 ctx.fillText(line.text, padding * d, screenY * d);
               }
               ctx.restore();
+            } else if (hasMultipleColors) {
+              // Per-span coloring for inline colored text (links, emphasis)
+              if (shouldJustify) {
+                drawColoredJustifiedLine(ctx, line.text, lineCharOffset, r.colorSpans,
+                  r.color || textColor, padding * d, screenY * d, availW * d);
+              } else if (centered) {
+                // Measure full line to center it, then draw colored from offset
+                const lineW = ctx.measureText(line.text).width;
+                const startX = (W * d - lineW) / 2;
+                drawColoredLine(ctx, line.text, lineCharOffset, r.colorSpans,
+                  r.color || textColor, startX, screenY * d);
+              } else {
+                drawColoredLine(ctx, line.text, lineCharOffset, r.colorSpans,
+                  r.color || textColor, padding * d, screenY * d);
+              }
             } else {
               if (centered) {
                 ctx.textAlign = "center";
@@ -1110,6 +1251,7 @@ export function createReflowRenderer(container, options = {}) {
               }
             }
           }
+          lineCharOffset += line.text.length;
           cursorY += lh;
         }
       } else if (r.type === "graphic" && r.bitmap) {
@@ -1132,7 +1274,8 @@ export function createReflowRenderer(container, options = {}) {
         }
         cursorY += r.drawH;
       }
-      cursorY += baseLH * 0.4;
+      const gapRatio = r.region?.gapRatio ?? 0.4;
+      cursorY += baseLH * Math.max(0.2, Math.min(gapRatio, 2.0));
     }
   }
 
@@ -1268,6 +1411,12 @@ export function createReflowRenderer(container, options = {}) {
 
       currentAnalysis = analysisCache.get(pageNum);
       currentPage = pageNum;
+
+      // Auto-match PDF body font size when user hasn't set an explicit fontSize
+      if (!userSetFontSize && currentAnalysis.bodyFontSize) {
+        fontSize = clamp(Math.round(currentAnalysis.bodyFontSize), minFont, maxFont);
+      }
+
       scrollY = 0;
       scrollVelocity = 0;
       reflow();
@@ -1279,6 +1428,7 @@ export function createReflowRenderer(container, options = {}) {
         graphicRegions: currentAnalysis.graphicRegions,
         pageWidth: currentAnalysis.pageWidth,
         pageHeight: currentAnalysis.pageHeight,
+        bodyFontSize: currentAnalysis.bodyFontSize,
       });
     },
 
