@@ -402,9 +402,13 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
     const lastW = lastItem.width || lastFH;
     const hGap = x - (lastX + lastW);
     const isHorizAdjacent = hGap < lastFH * 0.5 && hGap > -lastFH;
-    const isShortItem = (item.str || "").trim().length <= 2;
+    const itemText = (item.str || "").trim();
+    const isShortItem = itemText.length <= 2;
+    // Superscript detection: small item adjacent to larger text with size difference
     const isSuperscript = isShortItem && isHorizAdjacent && sizeRatio > 1.3;
-    const sizeOk = sizeRatio < 1.3 || isSuperscript;
+    // Also detect subscript (marker after text, smaller font)
+    const isSubscript = isShortItem && isHorizAdjacent && sizeRatio > 1.1 && hGap < lastFH * 0.3;
+    const sizeOk = sizeRatio < 1.3 || isSuperscript || isSubscript;
 
     // Large horizontal gap between consecutive items → likely column break
     // Only for substantive text (skip short items like superscript markers)
@@ -439,36 +443,78 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
   if (current) blocks.push(current);
 
   // Post-process: merge orphan tiny blocks (superscripts, markers like *, +, #)
-  // into the nearest larger block if vertically close
+  // into the nearest larger block if vertically close AND horizontally aligned
+  // IMPROVED: Better handling of footnote/superscript markers
+  const MARKER_CHARS = /^[*+†‡#$§¶]$/;
+  
   for (let i = blocks.length - 1; i >= 0; i--) {
     const block = blocks[i];
     if (block.items.length > 2) continue;
     const text = block.items.map(it => (it.str || "").trim()).join("");
-    if (text.length > 3 || text.length === 0) continue;
+    // Only merge marker-only blocks (1-2 chars, typically footnote symbols)
+    if (text.length > 2 || text.length === 0) continue;
+    // Must be a marker character or short symbol
+    const isMarker = text.split("").every(c => MARKER_CHARS.test(c) || c === "," || c === " ");
+    if (!isMarker && text.length > 1) continue;
 
     let bestIdx = -1, bestDist = Infinity;
+    let bestScore = -Infinity;
+    
     for (let j = 0; j < blocks.length; j++) {
       if (j === i) continue;
       const o = blocks[j];
       // Skip other orphans (short text blocks)
       const oText = o.items.map(it => (it.str || "").trim()).join("");
       if (oText.length <= 3) continue;
+      
       // Check vertical proximity: orphan center within 30pt of target block
       const bcy = block.bbox.y + block.bbox.h / 2;
       if (bcy < o.bbox.y - 30 || bcy > o.bbox.y + o.bbox.h + 30) continue;
-      // Horizontal edge-to-edge distance (0 if overlapping)
-      const hDist = Math.max(0,
-        block.bbox.x > o.bbox.x + o.bbox.w ? block.bbox.x - (o.bbox.x + o.bbox.w) :
-        o.bbox.x > block.bbox.x + block.bbox.w ? o.bbox.x - (block.bbox.x + block.bbox.w) : 0);
-      if (hDist < bestDist) {
+      
+      // Prefer blocks that are BEFORE this marker (markers attach to preceding text)
+      const blockIsBefore = o.bbox.y + o.bbox.h <= block.bbox.y + 5;
+      const blockIsAfter = o.bbox.y >= block.bbox.y + block.bbox.h - 5;
+      
+      // Horizontal position check - marker should be near the END of preceding text
+      // or at similar X position as text in the same line
+      const markerCenterX = block.bbox.x + block.bbox.w / 2;
+      const targetRight = o.bbox.x + o.bbox.w;
+      const targetLeft = o.bbox.x;
+      
+      // Score based on horizontal proximity to end of target text
+      let hScore = 0;
+      if (markerCenterX >= targetLeft && markerCenterX <= targetRight + block.bbox.w * 3) {
+        // Marker is within or near the target block's horizontal span
+        hScore = 10;
+      } else if (Math.abs(markerCenterX - targetRight) < block.bbox.w * 5) {
+        // Marker is close to the right edge of target
+        hScore = 5;
+      }
+      
+      // Prefer preceding blocks (superscripts come after text)
+      const vScore = blockIsBefore ? 20 : blockIsAfter ? 5 : 10;
+      const score = hScore + vScore;
+      
+      // Horizontal edge-to-edge distance
+      const hDist = blockIsBefore 
+        ? Math.abs(block.bbox.x - targetRight)  // Distance from marker left to target right
+        : Math.max(0,
+            block.bbox.x > o.bbox.x + o.bbox.w ? block.bbox.x - (o.bbox.x + o.bbox.w) :
+            o.bbox.x > block.bbox.x + block.bbox.w ? o.bbox.x - (block.bbox.x + block.bbox.w) : 0);
+      
+      if (score > bestScore || (score === bestScore && hDist < bestDist)) {
+        bestScore = score;
         bestDist = hDist;
         bestIdx = j;
       }
     }
 
-    if (bestIdx >= 0 && bestDist < Math.max(blocks[bestIdx].bbox.h, 20)) {
+    // Merge if found a suitable parent block
+    if (bestIdx >= 0 && (bestScore >= 15 || bestDist < Math.max(blocks[bestIdx].bbox.h, 20))) {
       const target = blocks[bestIdx];
       target.items.push(...block.items);
+      // Re-sort items by X position to maintain correct order
+      target.items.sort((a, b) => a.transform[4] - b.transform[4]);
       const newX = Math.min(target.bbox.x, block.bbox.x);
       const newRight = Math.max(target.bbox.x + target.bbox.w, block.bbox.x + block.bbox.w);
       const newBottom = Math.max(target.bbox.y + target.bbox.h, block.bbox.y + block.bbox.h);
@@ -478,6 +524,83 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
       blocks.splice(i, 1);
     }
   }
+
+  // Post-process: detect multi-column grids (like author sections)
+  // Group blocks that form aligned columns into a single composite block
+  const multiColumnBlocks = [];
+  const processed = new Set();
+  
+  for (let i = 0; i < blocks.length; i++) {
+    if (processed.has(i)) continue;
+    const block = blocks[i];
+    const blockText = block.items.map(it => (it.str || "").trim()).join(" ");
+    const blockCenterX = block.bbox.x + block.bbox.w / 2;
+    
+    // Find all blocks in same horizontal band (similar Y position)
+    const sameRowBlocks = [block];
+    const rowY = block.bbox.y;
+    const rowH = block.bbox.h;
+    
+    for (let j = i + 1; j < blocks.length; j++) {
+      if (processed.has(j)) continue;
+      const other = blocks[j];
+      // Check if in same row (vertical overlap)
+      const yOverlap = Math.max(0, Math.min(rowY + rowH, other.bbox.y + other.bbox.h) - Math.max(rowY, other.bbox.y));
+      const minH = Math.min(rowH, other.bbox.h);
+      if (yOverlap > minH * 0.5) {
+        sameRowBlocks.push(other);
+      }
+    }
+    
+    // If we have multiple blocks in same row, this might be a multi-column layout
+    if (sameRowBlocks.length >= 2) {
+      // Sort by X position
+      sameRowBlocks.sort((a, b) => a.bbox.x - b.bbox.x);
+      // Check if they're roughly aligned (similar height, spaced evenly)
+      const avgH = sameRowBlocks.reduce((s, b) => s + b.bbox.h, 0) / sameRowBlocks.length;
+      const heightsOk = sameRowBlocks.every(b => Math.abs(b.bbox.h - avgH) < avgH * 0.5);
+      
+      if (heightsOk) {
+        // Merge into a single composite block that preserves multi-column info
+        const allItems = [];
+        for (const b of sameRowBlocks) {
+          allItems.push(...b.items);
+          processed.add(blocks.indexOf(b));
+        }
+        // Sort items by Y then X to maintain reading order within the grid
+        allItems.sort((a, b) => {
+          const ay = pageHeight - a.transform[5];
+          const by = pageHeight - b.transform[5];
+          if (Math.abs(ay - by) > 2) return ay - by;
+          return a.transform[4] - b.transform[4];
+        });
+        
+        const bbox = {
+          x: Math.min(...sameRowBlocks.map(b => b.bbox.x)),
+          y: Math.min(...sameRowBlocks.map(b => b.bbox.y)),
+          w: Math.max(...sameRowBlocks.map(b => b.bbox.x + b.bbox.w)) - Math.min(...sameRowBlocks.map(b => b.bbox.x)),
+          h: Math.max(...sameRowBlocks.map(b => b.bbox.y + b.bbox.h)) - Math.min(...sameRowBlocks.map(b => b.bbox.y))
+        };
+        
+        multiColumnBlocks.push({
+          items: allItems,
+          bbox,
+          isMultiColumn: true,
+          columnCount: sameRowBlocks.length
+        });
+        continue;
+      }
+    }
+    
+    if (!processed.has(i)) {
+      multiColumnBlocks.push(block);
+      processed.add(i);
+    }
+  }
+  
+  // Replace blocks with multi-column merged version
+  blocks.length = 0;
+  blocks.push(...multiColumnBlocks);
 
   // Compute font metadata per block using real font objects from commonObjs
   for (const block of blocks) {
@@ -551,8 +674,7 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
 
 /**
  * Extract graphic regions from the page operator list.
- * Only captures image operators (paintImageXObject etc).
- * Skips path/fill/stroke to avoid false positives from text decorations.
+ * Captures images and horizontal divider lines (thin rectangles).
  */
 function extractGraphicRegions(opList, OPS) {
   const regions = [];
@@ -607,6 +729,23 @@ function extractGraphicRegions(opList, OPS) {
         regions.push({
           type: "graphic",
           bbox: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+        });
+      }
+    } else if (fn === OPS.rectangle) {
+      // Check for thin horizontal lines (dividers)
+      const [x, y, w, h] = args;
+      if (w > 100 && h > 0.5 && h < 5) {
+        const corners = [
+          transformPoint(x, y),
+          transformPoint(x + w, y),
+          transformPoint(x, y + h),
+          transformPoint(x + w, y + h),
+        ];
+        const xs = corners.map(c => c[0]);
+        const ys = corners.map(c => c[1]);
+        regions.push({
+          type: "divider",
+          bbox: { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) },
         });
       }
     }
@@ -744,7 +883,138 @@ function findParagraphThreshold(gaps, fontSize) {
 /**
  * Build text content for a block, preserving paragraph breaks.
  */
+function blockToTextMultiColumn(block, pageHeight) {
+  const rows = new Map();
+  const fontHeight = block.avgFontSize || 12;
+  const MARKER_PATTERN = /^[*+†‡#$§¶]$/; // Single char markers
+  
+  // Group items by row (finer granularity)
+  for (const item of block.items) {
+    if (!item.str) continue;
+    const y = pageHeight - item.transform[5];
+    const rowKey = Math.round(y / 2) * 2; // 2px granularity
+    if (!rows.has(rowKey)) rows.set(rowKey, []);
+    rows.get(rowKey).push(item);
+  }
+  
+  const sortedRows = Array.from(rows.keys()).sort((a, b) => a - b);
+  
+  // Merge rows: if a row has only short items (markers), merge with next row
+  const mergedRows = [];
+  let pendingRow = null;
+  
+  for (const rowKey of sortedRows) {
+    const rowItems = rows.get(rowKey).sort((a, b) => a.transform[4] - b.transform[4]);
+    const rowText = rowItems.map(it => (it.str || "").trim()).join("");
+    // A marker row has only single-char markers and possibly commas/spaces
+    const allMarkers = rowItems.every(it => {
+      const t = (it.str || "").trim();
+      return t.length <= 1 || MARKER_PATTERN.test(t) || t === "," || t === " ";
+    });
+    
+    if (allMarkers && rowItems.length >= 1 && rowText.length <= rowItems.length * 2) {
+      // This is a marker row - merge with next row
+      pendingRow = { key: rowKey, items: rowItems };
+    } else {
+      if (pendingRow) {
+        // Merge pending marker row with this row
+        // For each item in this row, find and attach the closest marker
+        const mergedItems = [];
+        const usedMarkers = new Set();
+        
+        for (const item of rowItems) {
+          const itemCenterX = item.transform[4] + (item.width || 0) / 2;
+          // Find closest marker that hasn't been used
+          let closestMarker = null;
+          let minDist = Infinity;
+          let closestIdx = -1;
+          
+          for (let mi = 0; mi < pendingRow.items.length; mi++) {
+            if (usedMarkers.has(mi)) continue;
+            const marker = pendingRow.items[mi];
+            const markerCenterX = marker.transform[4] + (marker.width || 0) / 2;
+            const dist = Math.abs(markerCenterX - itemCenterX);
+            if (dist < minDist) {
+              minDist = dist;
+              closestMarker = marker;
+              closestIdx = mi;
+            }
+          }
+          
+          // Attach marker to item if close enough
+          if (closestMarker && minDist < fontHeight * 3) { // Within 3x font height
+            mergedItems.push({...item, str: item.str + closestMarker.str});
+            usedMarkers.add(closestIdx);
+          } else {
+            mergedItems.push(item);
+          }
+        }
+        
+        // If there are unused markers, add them as separate items at the end
+        for (let mi = 0; mi < pendingRow.items.length; mi++) {
+          if (!usedMarkers.has(mi)) {
+            mergedItems.push(pendingRow.items[mi]);
+          }
+        }
+        
+        mergedItems.sort((a, b) => a.transform[4] - b.transform[4]);
+        mergedRows.push({ items: mergedItems, hasMarkers: true });
+        pendingRow = null;
+      } else {
+        mergedRows.push({ items: rowItems, hasMarkers: false });
+      }
+    }
+  }
+  
+  // Don't forget last pending row - add it as its own row
+  // (these are orphaned markers that couldn't be attached)
+  if (pendingRow) {
+    // Only add if it has actual content, not just empty
+    const hasContent = pendingRow.items.some(it => (it.str || "").trim().length > 0);
+    if (hasContent) {
+      mergedRows.push({ items: pendingRow.items, hasMarkers: true });
+    }
+  }
+  
+  // Build output lines
+  const lines = [];
+  for (const row of mergedRows) {
+    let lineText = "";
+    let lastX = null;
+    let lastW = 0;
+    let lastItemLen = 0;
+    
+    for (const item of row.items) {
+      const currentX = item.transform[4];
+      const currentItemLen = (item.str || "").trim().length;
+      const isShortItem = currentItemLen <= 3;
+      
+      if (lastX !== null) {
+        const hGap = currentX - (lastX + lastW);
+        const prevWasLong = lastItemLen > 2;
+        // Add column separator, but not before footnote markers
+        if (hGap > fontHeight * 0.3 && (!prevWasLong || !isShortItem)) {
+          lineText += "    ";
+        }
+      }
+      
+      lineText += item.str;
+      lastX = currentX;
+      lastW = item.width || fontHeight * 0.5;
+      lastItemLen = currentItemLen;
+    }
+    lines.push(lineText.trim());
+  }
+  
+  return lines.join("\n");
+}
+
 function blockToText(block, pageHeight) {
+  // Special handling for multi-column blocks (like author grids)
+  if (block.isMultiColumn && block.columnCount >= 2) {
+    return blockToTextMultiColumn(block, pageHeight);
+  }
+
   // First pass: collect all gaps and font sizes to compute adaptive threshold
   const gaps = [];
   let lastY = null;
@@ -772,37 +1042,71 @@ function blockToText(block, pageHeight) {
   lastY = null;
   let lastX = null;
   let lastW = 0;
+  let lastItemLen = 0; // Track length of previous item for marker detection
+  const MARKER_PATTERN = /^[*+†‡#$§¶\s,]+$/; // Pattern for footnote markers and separators
 
-  for (const item of block.items) {
+  for (let i = 0; i < block.items.length; i++) {
+    const item = block.items[i];
     if (!item.str) continue;
     const currentX = item.transform[4];
     const currentY = pageHeight - item.transform[5];
+    const currentItemLen = (item.str || "").trim().length;
+    const itemTextTrimmed = (item.str || "").trim();
+    // Short items are typically footnote markers (*, †, ‡, #, etc.)
+    // Allow up to 3 chars to handle combined markers like "* †"
+    const isShortItem = currentItemLen <= 3;
+    const isMarkerOnly = MARKER_PATTERN.test(itemTextTrimmed);
+    
+    // Check if next item is also a marker (to group markers together)
+    const nextItem = block.items[i + 1];
+    const nextIsMarker = nextItem && MARKER_PATTERN.test((nextItem.str || "").trim());
 
     if (lastY !== null) {
       const vGap = Math.abs(currentY - lastY);
-      const isShortItem = (item.str || "").trim().length <= 2;
+      
+      // Check if this looks like a superscript/subscript marker
+      // Markers have: small vertical offset, short text, often special chars
+      const isSuperscriptMarker = isShortItem && isMarkerOnly && vGap < lastFontSize * 0.6;
 
       // Use adaptive threshold for paragraph detection
+      // But don't split paragraphs for superscript markers
       if (vGap > lastFontSize * paraThreshold && !isShortItem) {
         result += "\n\n";
-      } else if (vGap > lineThreshold) {
+      } else if (vGap > lineThreshold && !isSuperscriptMarker) {
         // Different line — insert space
-        if (!result.endsWith(" ") && !result.endsWith("\n")) {
-          result += " ";
-        }
-      } else if (lastX !== null) {
-        // Same line — check horizontal gap between items
-        const hGap = currentX - (lastX + lastW);
-        if (hGap > lastFontSize * 0.15) {
+        // But skip space if previous item was long and current is short (footnote marker)
+        // This handles superscript markers like *, +, #, †, ‡
+        const prevWasLong = lastItemLen > 2;
+        if (!prevWasLong || !isShortItem) {
           if (!result.endsWith(" ") && !result.endsWith("\n")) {
             result += " ";
           }
         }
+      } else if (lastX !== null) {
+        // Same line or superscript position — check horizontal gap between items
+        const hGap = currentX - (lastX + lastW);
+        
+        // For markers: only add space if there's a significant gap
+        // This prevents "Mandelin *" and keeps "Mandelin*"
+        const minGapForSpace = isMarkerOnly 
+          ? lastFontSize * 0.5  // Larger threshold for markers
+          : lastFontSize * 0.15;
+          
+        // Skip adding space before short marker items
+        // These should attach directly to preceding text
+        if (hGap > minGapForSpace && !isMarkerOnly) {
+          if (!result.endsWith(" ") && !result.endsWith("\n")) {
+            result += " ";
+          }
+        }
+        // For markers after a space, don't add another space
+        // But add the marker directly to the text
       }
     }
     lastY = currentY;
     lastX = currentX;
     lastW = item.width || 0;
+    lastItemLen = currentItemLen;
     result += item.str;
   }
   return result.trim();
@@ -1212,6 +1516,13 @@ function reflowAndComposite(analysis, opts) {
         colorSpans: block.colorSpans || [],
         region,
       });
+    } else if (region.type === "divider") {
+      // Horizontal divider line
+      reflowedRegions.push({
+        type: "divider",
+        height: 4, // Small height for the divider line area
+        region,
+      });
     } else {
       // Graphic
       const bitmap = bitmaps.get(region);
@@ -1469,6 +1780,23 @@ export function createReflowRenderer(container, options = {}) {
           lineCharOffset += line.text.length;
           cursorY += lh;
         }
+      } else if (r.type === "divider") {
+        // Draw horizontal divider line
+        const screenY = cursorY - scrollY + 1; // Slight offset to center in area
+        if (screenY > -10 && screenY < H + 10) {
+          const lineWidth = Math.min(400, W - padding * 2); // Max 400px or fit with padding
+          const startX = (W - lineWidth) / 2; // Center the line
+          ctx.save();
+          ctx.strokeStyle = textColor;
+          ctx.globalAlpha = 0.3;
+          ctx.lineWidth = 1 * d;
+          ctx.beginPath();
+          ctx.moveTo(startX * d, screenY * d);
+          ctx.lineTo((startX + lineWidth) * d, screenY * d);
+          ctx.stroke();
+          ctx.restore();
+        }
+        cursorY += r.height;
       } else if (r.type === "graphic" && r.bitmap) {
         const screenY = cursorY - scrollY;
         if (screenY > -r.drawH && screenY < H + r.drawH) {
