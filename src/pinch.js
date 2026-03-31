@@ -393,6 +393,37 @@ export function createPDFPinchReader(container, options = {}) {
   }
 
   /**
+   * Find adaptive paragraph threshold by analyzing gap distribution.
+   */
+  function findParagraphThreshold(gaps, fontSize) {
+    if (gaps.length < 3) return 1.8;
+
+    // Filter out extreme outliers (>5x font size - likely headers, titles, etc.)
+    const filtered = gaps.filter(g => g / fontSize < 5);
+    if (filtered.length < 3) return 1.8;
+
+    const ratios = filtered.map(g => g / fontSize).sort((a, b) => a - b);
+
+    let maxGap = 0;
+    let threshold = 1.8;
+
+    for (let i = 0; i < ratios.length - 1; i++) {
+      const gap = ratios[i + 1] - ratios[i];
+      if (gap > maxGap && gap > 0.25 && ratios[i] > 0.8) {
+        maxGap = gap;
+        threshold = (ratios[i] + ratios[i + 1]) / 2;
+      }
+    }
+
+    if (maxGap < 0.2) {
+      const idx = Math.floor(ratios.length * 0.75);
+      threshold = ratios[Math.min(idx, ratios.length - 1)];
+    }
+
+    return Math.max(1.25, Math.min(threshold, 2.2));
+  }
+
+  /**
    * Extract plain text from a PDF page.
    * Joins text items with spaces, preserves paragraph breaks.
    */
@@ -400,10 +431,31 @@ export function createPDFPinchReader(container, options = {}) {
     const page = await pdfDoc.getPage(pageNum);
     const content = await page.getTextContent();
 
-    // Build text with paragraph detection
-    let result = "";
+    // First pass: collect all gaps to compute adaptive threshold
+    const gaps = [];
     let lastY = null;
     let lastFontSize = 12;
+
+    for (const item of content.items) {
+      if (!item.str || !item.transform) continue;
+
+      const currentY = item.transform[5];
+      const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
+      if (fontHeight > 0) lastFontSize = fontHeight;
+
+      if (lastY !== null) {
+        gaps.push(Math.abs(currentY - lastY));
+      }
+      lastY = currentY;
+    }
+
+    // Compute adaptive threshold
+    const paraThreshold = findParagraphThreshold(gaps, lastFontSize);
+    const lineThreshold = lastFontSize * 0.3;
+
+    // Second pass: build text with adaptive threshold
+    let result = "";
+    lastY = null;
 
     for (const item of content.items) {
       if (!item.str) continue;
@@ -415,10 +467,10 @@ export function createPDFPinchReader(container, options = {}) {
 
         if (lastY !== null) {
           const gap = Math.abs(currentY - lastY);
-          if (gap > lastFontSize * 1.8) {
+          if (gap > lastFontSize * paraThreshold) {
             // Paragraph break
             result += "\n\n";
-          } else if (gap > lastFontSize * 0.3) {
+          } else if (gap > lineThreshold) {
             // Line break within paragraph — add space
             if (!result.endsWith(" ") && !result.endsWith("\n")) {
               result += " ";

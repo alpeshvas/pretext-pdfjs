@@ -210,6 +210,30 @@ function visibleColor(fill, stroke, mode) {
 // ─── Page analysis ────────────────────────────────────────────────────────
 
 /**
+ * Find adaptive threshold for grouping items into blocks.
+ * Similar to paragraph detection but tuned for block-level grouping.
+ */
+function findBlockThreshold(gaps, fontSize) {
+  if (gaps.length < 3) return 2.0;  // Default block threshold
+
+  // Filter extreme outliers
+  const filtered = gaps.filter(g => g / fontSize < 5);
+  if (filtered.length < 3) return 2.0;
+
+  const ratios = filtered.map(g => g / fontSize).sort((a, b) => a - b);
+
+  // For block grouping, we want to be more conservative than paragraph detection
+  // Use the 60th percentile as the threshold - this separates:
+  // - Line spacing (~1.0-1.3x) from paragraph gaps (~1.5x+)
+  const idx = Math.floor(ratios.length * 0.6);
+  const threshold = ratios[Math.min(idx, ratios.length - 1)];
+
+  // Clamp: block threshold should be between 1.5x and 2.2x
+  // Lower than paragraph threshold to ensure paragraphs split into separate blocks
+  return Math.max(1.5, Math.min(threshold, 2.2));
+}
+
+/**
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
@@ -237,6 +261,23 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, itemColors) {
     if (Math.abs(ay - by) > 2) return ay - by;
     return a.transform[4] - b.transform[4];
   });
+
+  // First pass: collect all vertical gaps to compute adaptive block threshold
+  const gaps = [];
+  let lastY = null;
+  let lastFontSize = 12;
+  for (const item of sorted) {
+    const y = pageHeight - item.transform[5];
+    const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
+    if (fontHeight > 0) lastFontSize = fontHeight;
+    if (lastY !== null) {
+      gaps.push(Math.abs(y - lastY));
+    }
+    lastY = y;
+  }
+
+  // Compute adaptive block grouping threshold
+  const blockThreshold = findBlockThreshold(gaps, lastFontSize);
 
   const blocks = [];
   let current = null;
@@ -282,9 +323,10 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, itemColors) {
       continue;
     }
 
+    // Use adaptive block threshold instead of fixed 2.5x
     if (
       sizeOk &&
-      verticalGap < lastFH * 2.5 &&
+      verticalGap < lastFH * blockThreshold &&
       x < current.bbox.x + current.bbox.w + lastFH * 1.5
     ) {
       current.items.push(item);
@@ -567,28 +609,90 @@ function detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale) {
 }
 
 /**
+ * Find adaptive paragraph threshold by analyzing gap distribution.
+ * Uses histogram approach to find natural breakpoint between line gaps and paragraph gaps.
+ */
+function findParagraphThreshold(gaps, fontSize) {
+  if (gaps.length < 3) return 1.8;  // Fallback for small blocks
+
+  // Filter out extreme outliers (>5x font size - likely headers, titles, etc.)
+  const filtered = gaps.filter(g => g / fontSize < 5);
+  if (filtered.length < 3) return 1.8;
+
+  // Convert to font size ratios and sort
+  const ratios = filtered.map(g => g / fontSize).sort((a, b) => a - b);
+
+  // Find the largest gap between consecutive ratios (the "elbow")
+  // Look for a significant jump (>0.3) between line spacing and paragraph spacing
+  let maxGap = 0;
+  let threshold = 1.8;  // Default fallback
+
+  for (let i = 0; i < ratios.length - 1; i++) {
+    const gap = ratios[i + 1] - ratios[i];
+    // Look for significant gaps above typical line spacing (0.8x+)
+    if (gap > maxGap && gap > 0.25 && ratios[i] > 0.8) {
+      maxGap = gap;
+      threshold = (ratios[i] + ratios[i + 1]) / 2;
+    }
+  }
+
+  // If no clear cluster boundary found, use percentile-based approach
+  // 75th percentile usually separates lines from paragraphs
+  if (maxGap < 0.2) {
+    const idx = Math.floor(ratios.length * 0.75);
+    threshold = ratios[Math.min(idx, ratios.length - 1)];
+  }
+
+  // Clamp to reasonable range for paragraph detection
+  // Line spacing is typically 1.0-1.3x, paragraphs 1.3-1.8x+
+  return Math.max(1.25, Math.min(threshold, 2.2));
+}
+
+/**
  * Build text content for a block, preserving paragraph breaks.
  */
 function blockToText(block, pageHeight) {
-  let result = "";
+  // First pass: collect all gaps and font sizes to compute adaptive threshold
+  const gaps = [];
   let lastY = null;
-  let lastX = null;
-  let lastW = 0;
   let lastFontSize = 12;
 
   for (const item of block.items) {
     if (!item.str) continue;
-    const currentX = item.transform[4];
     const currentY = pageHeight - item.transform[5];
     const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
     if (fontHeight > 0) lastFontSize = fontHeight;
 
     if (lastY !== null) {
       const vGap = Math.abs(currentY - lastY);
+      gaps.push(vGap);
+    }
+    lastY = currentY;
+  }
+
+  // Compute adaptive paragraph threshold
+  const paraThreshold = findParagraphThreshold(gaps, lastFontSize);
+  const lineThreshold = lastFontSize * 0.3;  // Keep fixed line threshold
+
+  // Second pass: build text with adaptive threshold
+  let result = "";
+  lastY = null;
+  let lastX = null;
+  let lastW = 0;
+
+  for (const item of block.items) {
+    if (!item.str) continue;
+    const currentX = item.transform[4];
+    const currentY = pageHeight - item.transform[5];
+
+    if (lastY !== null) {
+      const vGap = Math.abs(currentY - lastY);
       const isShortItem = (item.str || "").trim().length <= 2;
-      if (vGap > lastFontSize * 1.8 && !isShortItem) {
+
+      // Use adaptive threshold for paragraph detection
+      if (vGap > lastFontSize * paraThreshold && !isShortItem) {
         result += "\n\n";
-      } else if (vGap > lastFontSize * 0.3) {
+      } else if (vGap > lineThreshold) {
         // Different line — insert space
         if (!result.endsWith(" ") && !result.endsWith("\n")) {
           result += " ";
