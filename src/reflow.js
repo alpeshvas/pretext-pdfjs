@@ -156,26 +156,18 @@ async function extractFontMetadata(page, opList, OPS) {
 // ─── Text color extraction ───────────────────────────────────────────────
 
 /**
- * Extract visible text colors per beginText/endText block pair.
- * Returns an array of color strings, one per text block.
+ * Extract one visible color per text-drawing operator in the operator list.
+ * Returns an array that maps ~1:1 to the text items from getTextContent().
  *
- * Tracks both fill and stroke colors plus text rendering mode to determine
- * the actual visible color. PDF.js normalizes all color operators to
- * setFillRGBColor / setStrokeRGBColor (hex strings), so those are the only
- * color ops that appear in the final operator list.
- *
- * Text rendering modes (lower 2 bits):
- *   0 = fill, 1 = stroke, 2 = fill+stroke, 3 = invisible
- * For stroke-only text (mode 1), we use the stroke color.
- * For invisible text (mode 3), we fall back to "#000000".
+ * Tracks fill/stroke colors and text rendering mode to pick the actual
+ * visible color. For showSpacedText, expands one color per string element
+ * since each can produce a separate text item.
  */
-function extractTextBlockColors(opList, OPS) {
-  const blockColors = []; // one entry per beginText/endText pair
+function extractTextItemColors(opList, OPS) {
+  const itemColors = []; // one entry per text-drawing operator
   let fillColor = "#000000";
   let strokeColor = "#000000";
-  let textRenderingMode = 0; // default: fill
-  let blockColor = "#000000";
-  let inTextBlock = false;
+  let textRenderingMode = 0;
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
@@ -186,29 +178,18 @@ function extractTextBlockColors(opList, OPS) {
       strokeColor = argsToHex(opList.argsArray[i]);
     } else if (fn === OPS.setTextRenderingMode) {
       textRenderingMode = opList.argsArray[i][0];
-    }
-
-    if (fn === OPS.beginText) {
-      inTextBlock = true;
-      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
-    }
-
-    // If color or rendering mode changes within a text block, update
-    if (inTextBlock && (
-      fn === OPS.setFillRGBColor ||
-      fn === OPS.setStrokeRGBColor ||
-      fn === OPS.setTextRenderingMode
-    )) {
-      blockColor = visibleColor(fillColor, strokeColor, textRenderingMode);
-    }
-
-    if (fn === OPS.endText) {
-      blockColors.push(blockColor);
-      inTextBlock = false;
+    } else if (
+      fn === OPS.showText ||
+      fn === OPS.nextLineShowText ||
+      fn === OPS.nextLineSetSpacingShowText
+    ) {
+      itemColors.push(visibleColor(fillColor, strokeColor, textRenderingMode));
+    } else if (fn === OPS.showSpacedText) {
+      itemColors.push(visibleColor(fillColor, strokeColor, textRenderingMode));
     }
   }
 
-  return blockColors;
+  return itemColors;
 }
 
 /** Convert color operator args to a hex string. Args may be a hex string or RGB byte array. */
@@ -229,46 +210,48 @@ function visibleColor(fill, stroke, mode) {
 // ─── Page analysis ────────────────────────────────────────────────────────
 
 /**
+ * Find adaptive threshold for grouping items into blocks.
+ * Similar to paragraph detection but tuned for block-level grouping.
+ */
+function findBlockThreshold(gaps, fontSize) {
+  if (gaps.length < 3) return 2.0;  // Default block threshold
+
+  // Filter extreme outliers
+  const filtered = gaps.filter(g => g / fontSize < 5);
+  if (filtered.length < 3) return 2.0;
+
+  const ratios = filtered.map(g => g / fontSize).sort((a, b) => a - b);
+
+  // For block grouping, we want to be more conservative than paragraph detection
+  // Use the 60th percentile as the threshold - this separates:
+  // - Line spacing (~1.0-1.3x) from paragraph gaps (~1.5x+)
+  const idx = Math.floor(ratios.length * 0.6);
+  const threshold = ratios[Math.min(idx, ratios.length - 1)];
+
+  // Clamp: block threshold should be between 1.5x and 2.2x
+  // Lower than paragraph threshold to ensure paragraphs split into separate blocks
+  return Math.max(1.5, Math.min(threshold, 2.2));
+}
+
+/**
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
-  // Map text items to beginText/endText blocks by detecting position
-  // discontinuities. Items within the same text block are contiguous and
-  // share the same color. When there's a large Y-position jump or font
-  // change, we advance to the next block's color.
-  if (blockColors && blockColors.length > 0) {
-    let blockIdx = 0;
-    let prevY = null;
-    let prevFontName = null;
-    let itemsInCurrentBlock = 0;
-
+function groupTextBlocks(textItems, pageHeight, styles, fontMap, itemColors) {
+  // Assign per-item colors directly by index — itemColors has one entry
+  // per text-drawing operator, which maps ~1:1 to text items.
+  if (itemColors && itemColors.length > 0) {
+    const realItems = textItems.filter(i => i.str !== undefined);
+    console.log('[reflow-debug-v3] itemColors:', itemColors.length, 'textItems:', realItems.length);
+    // Show first 15 items with their assigned color index
+    const preview = realItems.slice(0, 15).map((it, idx) => `[${idx}] "${it.str.slice(0,25)}" font=${it.fontName}`);
+    console.log('[reflow-debug-v3] items:', JSON.stringify(preview));
+    console.log('[reflow-debug-v3] colors[0..14]:', JSON.stringify(itemColors.slice(0, 15)));
+    let colorIdx = 0;
     for (const item of textItems) {
-      if (item.str === undefined) continue; // skip marked content
-
-      const y = item.transform ? item.transform[5] : null;
-      const fontHeight = item.transform
-        ? Math.hypot(item.transform[2], item.transform[3])
-        : 12;
-
-      // Detect text block boundary by position discontinuity
-      if (prevY !== null && y !== null && itemsInCurrentBlock > 0) {
-        const yDiff = Math.abs(y - prevY);
-        const fontChanged = item.fontName !== prevFontName;
-
-        if (
-          (yDiff > fontHeight * 3) ||
-          (fontChanged && yDiff > fontHeight * 0.5)
-        ) {
-          blockIdx = Math.min(blockIdx + 1, blockColors.length - 1);
-          itemsInCurrentBlock = 0;
-        }
-      }
-
-      item._color = blockColors[blockIdx] || "#000000";
-      itemsInCurrentBlock++;
-      prevY = y;
-      prevFontName = item.fontName;
+      if (item.str === undefined || !item.str.trim()) continue; // skip marked content, empty & whitespace-only
+      item._color = itemColors[colorIdx] || "#000000";
+      if (colorIdx < itemColors.length - 1) colorIdx++;
     }
   }
 
@@ -278,6 +261,23 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
     if (Math.abs(ay - by) > 2) return ay - by;
     return a.transform[4] - b.transform[4];
   });
+
+  // First pass: collect all vertical gaps to compute adaptive block threshold
+  const gaps = [];
+  let lastY = null;
+  let lastFontSize = 12;
+  for (const item of sorted) {
+    const y = pageHeight - item.transform[5];
+    const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
+    if (fontHeight > 0) lastFontSize = fontHeight;
+    if (lastY !== null) {
+      gaps.push(Math.abs(y - lastY));
+    }
+    lastY = y;
+  }
+
+  // Compute adaptive block grouping threshold
+  const blockThreshold = findBlockThreshold(gaps, lastFontSize);
 
   const blocks = [];
   let current = null;
@@ -323,9 +323,10 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
       continue;
     }
 
+    // Use adaptive block threshold instead of fixed 2.5x
     if (
       sizeOk &&
-      verticalGap < lastFH * 2.5 &&
+      verticalGap < lastFH * blockThreshold &&
       x < current.bbox.x + current.bbox.w + lastFH * 1.5
     ) {
       current.items.push(item);
@@ -608,28 +609,90 @@ function detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale) {
 }
 
 /**
+ * Find adaptive paragraph threshold by analyzing gap distribution.
+ * Uses histogram approach to find natural breakpoint between line gaps and paragraph gaps.
+ */
+function findParagraphThreshold(gaps, fontSize) {
+  if (gaps.length < 3) return 1.8;  // Fallback for small blocks
+
+  // Filter out extreme outliers (>5x font size - likely headers, titles, etc.)
+  const filtered = gaps.filter(g => g / fontSize < 5);
+  if (filtered.length < 3) return 1.8;
+
+  // Convert to font size ratios and sort
+  const ratios = filtered.map(g => g / fontSize).sort((a, b) => a - b);
+
+  // Find the largest gap between consecutive ratios (the "elbow")
+  // Look for a significant jump (>0.3) between line spacing and paragraph spacing
+  let maxGap = 0;
+  let threshold = 1.8;  // Default fallback
+
+  for (let i = 0; i < ratios.length - 1; i++) {
+    const gap = ratios[i + 1] - ratios[i];
+    // Look for significant gaps above typical line spacing (0.8x+)
+    if (gap > maxGap && gap > 0.25 && ratios[i] > 0.8) {
+      maxGap = gap;
+      threshold = (ratios[i] + ratios[i + 1]) / 2;
+    }
+  }
+
+  // If no clear cluster boundary found, use percentile-based approach
+  // 75th percentile usually separates lines from paragraphs
+  if (maxGap < 0.2) {
+    const idx = Math.floor(ratios.length * 0.75);
+    threshold = ratios[Math.min(idx, ratios.length - 1)];
+  }
+
+  // Clamp to reasonable range for paragraph detection
+  // Line spacing is typically 1.0-1.3x, paragraphs 1.3-1.8x+
+  return Math.max(1.25, Math.min(threshold, 2.2));
+}
+
+/**
  * Build text content for a block, preserving paragraph breaks.
  */
 function blockToText(block, pageHeight) {
-  let result = "";
+  // First pass: collect all gaps and font sizes to compute adaptive threshold
+  const gaps = [];
   let lastY = null;
-  let lastX = null;
-  let lastW = 0;
   let lastFontSize = 12;
 
   for (const item of block.items) {
     if (!item.str) continue;
-    const currentX = item.transform[4];
     const currentY = pageHeight - item.transform[5];
     const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
     if (fontHeight > 0) lastFontSize = fontHeight;
 
     if (lastY !== null) {
       const vGap = Math.abs(currentY - lastY);
+      gaps.push(vGap);
+    }
+    lastY = currentY;
+  }
+
+  // Compute adaptive paragraph threshold
+  const paraThreshold = findParagraphThreshold(gaps, lastFontSize);
+  const lineThreshold = lastFontSize * 0.3;  // Keep fixed line threshold
+
+  // Second pass: build text with adaptive threshold
+  let result = "";
+  lastY = null;
+  let lastX = null;
+  let lastW = 0;
+
+  for (const item of block.items) {
+    if (!item.str) continue;
+    const currentX = item.transform[4];
+    const currentY = pageHeight - item.transform[5];
+
+    if (lastY !== null) {
+      const vGap = Math.abs(currentY - lastY);
       const isShortItem = (item.str || "").trim().length <= 2;
-      if (vGap > lastFontSize * 1.8 && !isShortItem) {
+
+      // Use adaptive threshold for paragraph detection
+      if (vGap > lastFontSize * paraThreshold && !isShortItem) {
         result += "\n\n";
-      } else if (vGap > lastFontSize * 0.3) {
+      } else if (vGap > lineThreshold) {
         // Different line — insert space
         if (!result.endsWith(" ") && !result.endsWith("\n")) {
           result += " ";
@@ -923,10 +986,10 @@ async function analyzePage(page, OPS) {
   const fontMap = await extractFontMetadata(page, opList, OPS);
 
   // Extract text colors per beginText/endText block (not per operator)
-  const blockColors = extractTextBlockColors(opList, OPS);
+  const itemColors = extractTextItemColors(opList, OPS);
 
   // Now group text blocks with real font data and block colors
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, blockColors);
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, itemColors);
 
   // Compute body font size (most common size = body text)
   const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
