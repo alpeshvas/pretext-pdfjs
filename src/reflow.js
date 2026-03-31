@@ -1561,9 +1561,85 @@ function reflowAndComposite(analysis, opts) {
     };
   }
 
+  // Pre-pass: merge runs of narrow text blocks into structured blocks
+  // Author grids get fragmented by groupTextBlocks — merge consecutive narrow blocks
+  // that together span a significant portion of the page width
+  const mergedMap = [];
+  let mi = 0;
+  while (mi < regionMap.length) {
+    const region = regionMap[mi];
+    if (region.type !== "text" || region.block.bbox.w > pageWidth * 0.5) {
+      mergedMap.push(region);
+      mi++;
+      continue;
+    }
+
+    // Collect consecutive narrow text blocks within a compact vertical range
+    // Stop at large vertical gaps (section breaks) or non-text regions
+    const run = [region];
+    const startY = region.bbox.y;
+    let mj = mi + 1;
+    while (mj < regionMap.length) {
+      const next = regionMap[mj];
+      if (next.type !== "text") break;
+      // Large vertical gap = section break (e.g., before "Abstract")
+      const gap = next.gapAbsolute || 0;
+      const avgFS = next.block.avgFontSize || 12;
+      if (gap > avgFS * 3) break;
+      // Only include narrow blocks or wide blocks with high X-cluster count
+      if (next.block.bbox.w > pageWidth * 0.5) {
+        const nxPos = next.block.items.map(it => it.transform[4]).sort((a, b) => a - b);
+        let nxC = 1;
+        for (let k = 1; k < nxPos.length; k++) {
+          if (nxPos[k] - nxPos[k - 1] > avgFS * 5) nxC++;
+        }
+        if (nxC < 3) break;
+      }
+      if (next.bbox.y + next.bbox.h - startY > pageHeight * 0.25) break;
+      run.push(next);
+      mj++;
+    }
+
+    if (run.length >= 3) {
+      const combinedX = Math.min(...run.map(r => r.bbox.x));
+      const combinedW = Math.max(...run.map(r => r.bbox.x + r.bbox.w)) - combinedX;
+      if (combinedW > pageWidth * 0.4) {
+        // Merge into a single block for structured positioning
+        const allItems = [];
+        for (const r of run) allItems.push(...r.block.items);
+        const mergedBbox = {
+          x: combinedX,
+          y: Math.min(...run.map(r => r.bbox.y)),
+          w: combinedW,
+          h: Math.max(...run.map(r => r.bbox.y + r.bbox.h)) - Math.min(...run.map(r => r.bbox.y)),
+        };
+        const first = run[0].block;
+        mergedMap.push({
+          type: "text",
+          block: {
+            items: allItems,
+            bbox: mergedBbox,
+            avgFontSize: first.avgFontSize,
+            fontScale: first.fontScale,
+            fontMeta: first.fontMeta,
+            color: first.color,
+            _structured: true, // Merged narrow blocks = structured layout
+          },
+          bbox: mergedBbox,
+          gapAbsolute: run[0].gapAbsolute,
+          _avgBodyFontSize: run[0]._avgBodyFontSize,
+        });
+        mi = mj;
+        continue;
+      }
+    }
+    mergedMap.push(region);
+    mi++;
+  }
+
   const reflowedRegions = [];
 
-  for (const region of regionMap) {
+  for (const region of mergedMap) {
     if (region.type === "text") {
       const block = region.block;
       const text = blockToText(block, pageHeight);
@@ -1572,16 +1648,9 @@ function reflowAndComposite(analysis, opts) {
         continue;
       }
 
-      // Detect structured blocks via X-cluster count
-      // Structured blocks (author grids, multi-column headers) preserve proportional layout
-      const xPositions = block.items.map(it => it.transform[4]).sort((a, b) => a - b);
-      let xClusters = 1;
-      for (let xi = 1; xi < xPositions.length; xi++) {
-        if (xPositions[xi] - xPositions[xi - 1] > (block.avgFontSize || 12) * 3) xClusters++;
-      }
-      const isStructuredBlock = xClusters >= 3 &&
-        block.bbox.w > pageWidth * 0.6 &&
-        block.bbox.h < pageHeight * 0.25;
+      // Structured blocks are identified by the merge pre-pass (_structured flag)
+      const isStructuredBlock = !!block._structured;
+
 
       if (isStructuredBlock) {
         // Proportional positioning: preserve original relative layout scaled to fit
