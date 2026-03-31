@@ -1,6 +1,6 @@
 {
   "name": "pretext-pdfjs",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Pretext-native text layer for PDF.js — zero DOM reflows, per-block reflow with image preservation, pinch-to-zoom text",
   "type": "module",
   "main": "./src/index.js",
