@@ -156,25 +156,26 @@ async function extractFontMetadata(page, opList, OPS) {
 // ─── Text color extraction ───────────────────────────────────────────────
 
 /**
- * Extract fill colors from the operator list, indexed by text-drawing op.
- * The evaluator normalizes all fill-color commands to setFillRGBColor with
- * a hex string, so that's the primary path. Returns an array parallel to
- * the text items from getTextContent().
+ * Extract fill colors per beginText/endText block pair.
+ * Returns an array of color strings, one per text block.
+ *
+ * The previous approach pushed one color per text-drawing operator (showText,
+ * showSpacedText, etc.) and tried to index into text items 1:1. That mapping
+ * is broken because a single showSpacedText operator can produce multiple text
+ * items via buildTextContentItem(). Instead, we track color at text-block
+ * boundaries — all text items within the same beginText/endText pair share
+ * the same color context.
  */
-function extractTextColors(opList, OPS) {
-  const textColors = [];
+function extractTextBlockColors(opList, OPS) {
+  const blockColors = []; // one entry per beginText/endText pair
   let currentColor = "#000000";
-
-  const textDrawOps = new Set([
-    OPS.showText,
-    OPS.showSpacedText,
-    OPS.nextLineShowText,
-    OPS.nextLineSetSpacingShowText,
-  ]);
+  let blockColor = "#000000";
+  let inTextBlock = false;
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const fn = opList.fnArray[i];
 
+    // Track color changes
     if (fn === OPS.setFillRGBColor) {
       currentColor = opList.argsArray[i][0];
     } else if (fn === OPS.setFillTransparent) {
@@ -191,12 +192,30 @@ function extractTextColors(opList, OPS) {
       }
     }
 
-    if (textDrawOps.has(fn)) {
-      textColors.push(currentColor);
+    if (fn === OPS.beginText) {
+      inTextBlock = true;
+      blockColor = currentColor; // color at start of block
+    }
+
+    // If color changes within a text block, update (last color wins)
+    if (inTextBlock && (
+      fn === OPS.setFillRGBColor ||
+      fn === OPS.setFillTransparent ||
+      fn === OPS.setFillGray ||
+      fn === OPS.setFillColor ||
+      fn === OPS.setFillCMYKColor ||
+      fn === OPS.setFillColorN
+    )) {
+      blockColor = currentColor;
+    }
+
+    if (fn === OPS.endText) {
+      blockColors.push(blockColor);
+      inTextBlock = false;
     }
   }
 
-  return textColors;
+  return blockColors;
 }
 
 // ─── Page analysis ────────────────────────────────────────────────────────
@@ -205,15 +224,43 @@ function extractTextColors(opList, OPS) {
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles, fontMap, textColors) {
-  // Attach colors to text items before filtering (textColors is parallel to
-  // the full items array from getTextContent, including empty items)
-  if (textColors) {
-    let colorIdx = 0;
+function groupTextBlocks(textItems, pageHeight, styles, fontMap, blockColors) {
+  // Map text items to beginText/endText blocks by detecting position
+  // discontinuities. Items within the same text block are contiguous and
+  // share the same color. When there's a large Y-position jump or font
+  // change, we advance to the next block's color.
+  if (blockColors && blockColors.length > 0) {
+    let blockIdx = 0;
+    let prevY = null;
+    let prevFontName = null;
+    let itemsInCurrentBlock = 0;
+
     for (const item of textItems) {
-      if (item.str !== undefined) {
-        item._color = textColors[colorIdx++] || "#000000";
+      if (item.str === undefined) continue; // skip marked content
+
+      const y = item.transform ? item.transform[5] : null;
+      const fontHeight = item.transform
+        ? Math.hypot(item.transform[2], item.transform[3])
+        : 12;
+
+      // Detect text block boundary by position discontinuity
+      if (prevY !== null && y !== null && itemsInCurrentBlock > 0) {
+        const yDiff = Math.abs(y - prevY);
+        const fontChanged = item.fontName !== prevFontName;
+
+        if (
+          (yDiff > fontHeight * 3) ||
+          (fontChanged && yDiff > fontHeight * 0.5)
+        ) {
+          blockIdx = Math.min(blockIdx + 1, blockColors.length - 1);
+          itemsInCurrentBlock = 0;
+        }
       }
+
+      item._color = blockColors[blockIdx] || "#000000";
+      itemsInCurrentBlock++;
+      prevY = y;
+      prevFontName = item.fontName;
     }
   }
 
@@ -754,16 +801,20 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
     curr.gapBefore = Math.max(0, currTop - prevBottom);
   }
   if (regions.length > 0) {
-    regions[0].gapBefore = regions[0].bbox.y;
+    regions[0].gapBefore = 0; // padding handles top margin
   }
 
-  // Normalize gaps relative to average body line height
+  // Store absolute pixel gaps and compute body font size for scaling
   const bodyBlocks = regions.filter(r =>
     r.type === "text" && r.block?.fontScale && Math.abs(r.block.fontScale - 1) < 0.15);
-  const avgBodyLH = bodyBlocks.length > 0
-    ? bodyBlocks.reduce((s, r) => s + r.block.avgFontSize * 1.6, 0) / bodyBlocks.length
-    : 12 * 1.6;
+  const avgBodyFontSize = bodyBlocks.length > 0
+    ? bodyBlocks.reduce((s, r) => s + r.block.avgFontSize, 0) / bodyBlocks.length
+    : 12;
   for (const region of regions) {
+    region.gapAbsolute = region.gapBefore || 0;
+    region._avgBodyFontSize = avgBodyFontSize;
+    // Keep gapRatio as fallback for any code that reads it
+    const avgBodyLH = avgBodyFontSize * 1.6;
     region.gapRatio = (region.gapBefore || 0) / avgBodyLH;
   }
 
@@ -865,11 +916,11 @@ async function analyzePage(page, OPS) {
   // Extract real font metadata from commonObjs (bold, italic, weight, loadedName)
   const fontMap = await extractFontMetadata(page, opList, OPS);
 
-  // Extract text colors from operator list (parallel to text items)
-  const textColors = extractTextColors(opList, OPS);
+  // Extract text colors per beginText/endText block (not per operator)
+  const blockColors = extractTextBlockColors(opList, OPS);
 
-  // Now group text blocks with real font data and colors
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, textColors);
+  // Now group text blocks with real font data and block colors
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, blockColors);
 
   // Compute body font size (most common size = body text)
   const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
@@ -1028,13 +1079,15 @@ function reflowAndComposite(analysis, opts) {
     }
   }
 
-  // Total height — use original PDF gap ratios between regions
+  // Total height — use absolute pixel gaps scaled by font ratio
   const baseLH = fontSize * lineHeight;
   let totalHeight = padding;
   for (const r of reflowedRegions) {
     totalHeight += r.height;
-    const gapRatio = r.region?.gapRatio ?? 0.4;
-    totalHeight += baseLH * Math.max(0.2, Math.min(gapRatio, 2.0));
+    const gapAbs = r.region?.gapAbsolute ?? 0;
+    const bodyFS = r.region?._avgBodyFontSize || 12;
+    const scaledGap = gapAbs * (fontSize / bodyFS);
+    totalHeight += Math.max(4, Math.min(scaledGap, baseLH * 2.0));
   }
   totalHeight += padding;
 
@@ -1274,8 +1327,10 @@ export function createReflowRenderer(container, options = {}) {
         }
         cursorY += r.drawH;
       }
-      const gapRatio = r.region?.gapRatio ?? 0.4;
-      cursorY += baseLH * Math.max(0.2, Math.min(gapRatio, 2.0));
+      const gapAbs = r.region?.gapAbsolute ?? 0;
+      const bodyFS = r.region?._avgBodyFontSize || 12;
+      const scaledGap = gapAbs * (fontSize / bodyFS);
+      cursorY += Math.max(4, Math.min(scaledGap, baseLH * 2.0));
     }
   }
 
