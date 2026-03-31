@@ -80,13 +80,70 @@ async function extractFontMetadata(page, opList, OPS) {
   return fontMap;
 }
 
+// ─── Text color extraction ───────────────────────────────────────────────
+
+/**
+ * Extract fill colors from the operator list, indexed by text-drawing op.
+ * The evaluator normalizes all fill-color commands to setFillRGBColor with
+ * a hex string, so that's the primary path. Returns an array parallel to
+ * the text items from getTextContent().
+ */
+function extractTextColors(opList, OPS) {
+  const textColors = [];
+  let currentColor = "#000000";
+
+  const textDrawOps = new Set([
+    OPS.showText,
+    OPS.showSpacedText,
+    OPS.nextLineShowText,
+    OPS.nextLineSetSpacingShowText,
+  ]);
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+
+    if (fn === OPS.setFillRGBColor) {
+      currentColor = opList.argsArray[i][0];
+    } else if (fn === OPS.setFillTransparent) {
+      currentColor = "transparent";
+    } else if (
+      fn === OPS.setFillGray ||
+      fn === OPS.setFillColor ||
+      fn === OPS.setFillCMYKColor ||
+      fn === OPS.setFillColorN
+    ) {
+      const args = opList.argsArray[i];
+      if (args?.[0] && typeof args[0] === "string" && args[0].startsWith("#")) {
+        currentColor = args[0];
+      }
+    }
+
+    if (textDrawOps.has(fn)) {
+      textColors.push(currentColor);
+    }
+  }
+
+  return textColors;
+}
+
 // ─── Page analysis ────────────────────────────────────────────────────────
 
 /**
  * Group adjacent text items into text blocks by proximity.
  * Also extracts font metadata: average size, italic, bold.
  */
-function groupTextBlocks(textItems, pageHeight, styles, fontMap) {
+function groupTextBlocks(textItems, pageHeight, styles, fontMap, textColors) {
+  // Attach colors to text items before filtering (textColors is parallel to
+  // the full items array from getTextContent, including empty items)
+  if (textColors) {
+    let colorIdx = 0;
+    for (const item of textItems) {
+      if (item.str !== undefined) {
+        item._color = textColors[colorIdx++] || "#000000";
+      }
+    }
+  }
+
   const sorted = [...textItems].filter(i => i.str?.trim()).sort((a, b) => {
     const ay = pageHeight - a.transform[5];
     const by = pageHeight - b.transform[5];
@@ -226,6 +283,24 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap) {
 
     // Store the font metadata for the dominant font in this block
     block.fontMeta = fontMap?.get(block.items[0]?.fontName) || null;
+
+    // Compute dominant fill color for the block
+    const colorFreq = {};
+    for (const item of block.items) {
+      const c = item._color || "#000000";
+      if (c !== "transparent") {
+        colorFreq[c] = (colorFreq[c] || 0) + 1;
+      }
+    }
+    let dominantColor = "#000000";
+    let maxColorFreq = 0;
+    for (const [c, freq] of Object.entries(colorFreq)) {
+      if (freq > maxColorFreq) {
+        maxColorFreq = freq;
+        dominantColor = c;
+      }
+    }
+    block.color = dominantColor;
   }
 
   return blocks;
@@ -389,26 +464,40 @@ function detectGraphicRegionsFromRender(offCanvas, textBlocks, renderScale) {
 function blockToText(block, pageHeight) {
   let result = "";
   let lastY = null;
+  let lastX = null;
+  let lastW = 0;
   let lastFontSize = 12;
 
   for (const item of block.items) {
     if (!item.str) continue;
+    const currentX = item.transform[4];
     const currentY = pageHeight - item.transform[5];
     const fontHeight = Math.hypot(item.transform[2], item.transform[3]);
     if (fontHeight > 0) lastFontSize = fontHeight;
 
     if (lastY !== null) {
-      const gap = Math.abs(currentY - lastY);
+      const vGap = Math.abs(currentY - lastY);
       const isShortItem = (item.str || "").trim().length <= 2;
-      if (gap > lastFontSize * 1.8 && !isShortItem) {
+      if (vGap > lastFontSize * 1.8 && !isShortItem) {
         result += "\n\n";
-      } else if (gap > lastFontSize * 0.3) {
+      } else if (vGap > lastFontSize * 0.3) {
+        // Different line — insert space
         if (!result.endsWith(" ") && !result.endsWith("\n")) {
           result += " ";
+        }
+      } else if (lastX !== null) {
+        // Same line — check horizontal gap between items
+        const hGap = currentX - (lastX + lastW);
+        if (hGap > lastFontSize * 0.15) {
+          if (!result.endsWith(" ") && !result.endsWith("\n")) {
+            result += " ";
+          }
         }
       }
     }
     lastY = currentY;
+    lastX = currentX;
+    lastW = item.width || 0;
     result += item.str;
   }
   return result.trim();
@@ -658,8 +747,11 @@ async function analyzePage(page, OPS) {
   // Extract real font metadata from commonObjs (bold, italic, weight, loadedName)
   const fontMap = await extractFontMetadata(page, opList, OPS);
 
-  // Now group text blocks with real font data
-  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap);
+  // Extract text colors from operator list (parallel to text items)
+  const textColors = extractTextColors(opList, OPS);
+
+  // Now group text blocks with real font data and colors
+  const textBlocks = groupTextBlocks(textContent.items, pageHeight, textContent.styles, fontMap, textColors);
 
   // Compute body font size (most common size = body text)
   const allSizes = textBlocks.map(b => Math.round(b.avgFontSize * 10) / 10);
@@ -784,6 +876,7 @@ function reflowAndComposite(analysis, opts) {
         fontWeight: weight,
         fontFamily: blockFamily,
         align: block.align || "left",
+        color: block.color,
         region,
       });
     } else {
@@ -947,7 +1040,7 @@ export function createReflowRenderer(container, options = {}) {
         const availW = W - padding * 2;
 
         if (!enableMorph) {
-          ctx.fillStyle = textColor;
+          ctx.fillStyle = r.color || textColor;
           ctx.font = `${style} ${weight} ${fs * d}px ${rFamily}`;
         }
 
@@ -965,10 +1058,24 @@ export function createReflowRenderer(container, options = {}) {
               const ease = 1 - (1 - t) ** 3;
               const morphedFS = fs * (1 - ease * (1 - edgeFontRatio));
               const opacity = 1.0 + (0.2 - 1.0) * ease;
-              const c = Math.round(37 - (37 - 160) * ease);
+              // Blend the block's actual color toward gray at edges
+              const blockColor = r.color || textColor;
+              let morphColor;
+              if (blockColor.startsWith("#") && blockColor.length === 7) {
+                const br = parseInt(blockColor.slice(1, 3), 16);
+                const bg_ = parseInt(blockColor.slice(3, 5), 16);
+                const bb = parseInt(blockColor.slice(5, 7), 16);
+                const dimR = Math.round(br + (160 - br) * ease);
+                const dimG = Math.round(bg_ + (160 - bg_) * ease);
+                const dimB = Math.round(bb + (160 - bb) * ease);
+                morphColor = `rgb(${dimR},${dimG},${dimB})`;
+              } else {
+                const c = Math.round(37 - (37 - 160) * ease);
+                morphColor = `rgb(${c},${c - 2},${c - 3})`;
+              }
               ctx.save();
               ctx.globalAlpha = opacity;
-              ctx.fillStyle = `rgb(${c},${c - 2},${c - 3})`;
+              ctx.fillStyle = morphColor;
               ctx.font = `${style} ${weight} ${morphedFS * d}px ${rFamily}`;
               if (centered) {
                 ctx.textAlign = "center";
