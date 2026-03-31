@@ -106,6 +106,42 @@ function drawColoredJustifiedLine(ctx, text, charOffset, spans, defaultColor, x,
   }
 }
 
+/**
+ * Draw a line of text with per-segment font style switching (bold/italic transitions).
+ */
+function drawStyledLine(ctx, text, charOffset, segments, baseFontSize, fontFamily, dpr, defaultColor, x, y) {
+  const lineStart = charOffset;
+  const lineEnd = charOffset + text.length;
+  let xPos = x;
+  let pos = 0;
+
+  for (const seg of segments) {
+    if (seg.charEnd <= lineStart || seg.charStart >= lineEnd) continue;
+    const overlapStart = Math.max(seg.charStart - lineStart, 0);
+    const overlapEnd = Math.min(seg.charEnd - lineStart, text.length);
+
+    // Draw any gap before this segment with default style
+    if (overlapStart > pos) {
+      const gapText = text.slice(pos, overlapStart);
+      ctx.fillText(gapText, xPos, y);
+      xPos += ctx.measureText(gapText).width;
+    }
+
+    const segText = text.slice(overlapStart, overlapEnd);
+    const weight = seg.bold ? 700 : 400;
+    const style = seg.italic ? "italic" : "normal";
+    ctx.font = `${style} ${weight} ${baseFontSize * dpr}px ${fontFamily}`;
+    ctx.fillStyle = defaultColor;
+    ctx.fillText(segText, xPos, y);
+    xPos += ctx.measureText(segText).width;
+    pos = overlapEnd;
+  }
+
+  if (pos < text.length) {
+    ctx.fillText(text.slice(pos), xPos, y);
+  }
+}
+
 function bboxOverlap(a, b) {
   const x1 = Math.max(a.x, b.x);
   const y1 = Math.max(a.y, b.y);
@@ -399,9 +435,10 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
       ? Math.max(fontHeight, lastFH) / Math.min(fontHeight, lastFH)
       : 1;
     const lastX = lastItem.transform[4];
-    const lastW = lastItem.width || lastFH;
+    const lastItemStr = (lastItem.str || "");
+    const lastW = lastItem.width || (lastFH * 0.55 * lastItemStr.length) || lastFH;
     const hGap = x - (lastX + lastW);
-    const isHorizAdjacent = hGap < lastFH * 0.5 && hGap > -lastFH;
+    const isHorizAdjacent = hGap < lastFH * 0.8 && hGap > -lastFH;
     const itemText = (item.str || "").trim();
     const isShortItem = itemText.length <= 2;
     // Superscript detection: small item adjacent to larger text with size difference
@@ -667,6 +704,38 @@ function groupTextBlocks(textItems, pageHeight, styles, fontMap, textRuns) {
       }
       block.colorSpans.push({ charStart: spanCharStart, charEnd: charCount, color: spanColor });
     }
+
+    // Build styled segments — contiguous runs sharing the same bold/italic style
+    block.styledSegments = [];
+    if (block.items.length > 0) {
+      const fm0 = fontMap?.get(block.items[0]?.fontName);
+      let segBold = !!(fm0?.bold || fm0?.black);
+      let segItalic = !!fm0?.italic;
+      let segCharStart = 0;
+      let stCharCount = 0;
+
+      for (let i = 0; i < block.items.length; i++) {
+        const fm = fontMap?.get(block.items[i].fontName);
+        const itemBold = !!(fm?.bold || fm?.black);
+        const itemItalic = !!fm?.italic;
+        const itemLen = (block.items[i].str || "").length;
+
+        if (itemBold !== segBold || itemItalic !== segItalic) {
+          block.styledSegments.push({ charStart: segCharStart, charEnd: stCharCount, bold: segBold, italic: segItalic });
+          segCharStart = stCharCount;
+          segBold = itemBold;
+          segItalic = itemItalic;
+        }
+        stCharCount += itemLen;
+        if (i < block.items.length - 1) stCharCount++;
+      }
+      block.styledSegments.push({ charStart: segCharStart, charEnd: stCharCount, bold: segBold, italic: segItalic });
+    }
+
+    // Only keep styledSegments if there are actual style transitions
+    if (block.styledSegments.length <= 1) {
+      block.styledSegments = null;
+    }
   }
 
   return blocks;
@@ -747,6 +816,25 @@ function extractGraphicRegions(opList, OPS) {
           type: "divider",
           bbox: { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) },
         });
+      }
+    } else if (fn === OPS.constructPath) {
+      // Detect horizontal lines drawn via moveTo + lineTo
+      const subOps = args[0];
+      const coords = args[1];
+      if (subOps?.length === 2 && subOps[0] === 13 && subOps[1] === 14) {
+        const [x1, y1, x2, y2] = coords;
+        if (Math.abs(x2 - x1) > 100 && Math.abs(y2 - y1) < 3) {
+          const p1 = transformPoint(x1, y1);
+          const p2 = transformPoint(x2, y2);
+          const minX = Math.min(p1[0], p2[0]);
+          const maxX = Math.max(p1[0], p2[0]);
+          const minY = Math.min(p1[1], p2[1]);
+          const maxY = Math.max(p1[1], p2[1]);
+          regions.push({
+            type: "divider",
+            bbox: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+          });
+        }
       }
     }
   }
@@ -1132,10 +1220,14 @@ function buildRegionMap(textBlocks, graphicRegions, pageHeight) {
       ? { ...gr.bbox }
       : { x: gr.bbox.x, y: pageHeight - gr.bbox.y - gr.bbox.h, w: gr.bbox.w, h: gr.bbox.h };
 
-    // Skip if this graphic region overlaps significantly with any text block
-    const overlapsText = textBboxes.some(tb => bboxOverlap(bbox, tb) > 0.3);
-    if (!overlapsText) {
-      regions.push({ type: "graphic", bbox });
+    // Dividers pass through without text-overlap check
+    if (gr.type === "divider") {
+      regions.push({ type: "divider", bbox });
+    } else {
+      const overlapsText = textBboxes.some(tb => bboxOverlap(bbox, tb) > 0.3);
+      if (!overlapsText) {
+        regions.push({ type: "graphic", bbox });
+      }
     }
   }
 
@@ -1480,6 +1572,63 @@ function reflowAndComposite(analysis, opts) {
         continue;
       }
 
+      // Detect structured blocks via X-cluster count
+      // Structured blocks (author grids, multi-column headers) preserve proportional layout
+      const xPositions = block.items.map(it => it.transform[4]).sort((a, b) => a - b);
+      let xClusters = 1;
+      for (let xi = 1; xi < xPositions.length; xi++) {
+        if (xPositions[xi] - xPositions[xi - 1] > (block.avgFontSize || 12) * 3) xClusters++;
+      }
+      const isStructuredBlock = xClusters >= 3 &&
+        block.bbox.w > pageWidth * 0.6 &&
+        block.bbox.h < pageHeight * 0.25;
+
+      if (isStructuredBlock) {
+        // Proportional positioning: preserve original relative layout scaled to fit
+        const blockFontSize = Math.round(fontSize * (block.fontScale || 1));
+        const scale = blockFontSize / (block.avgFontSize || 12);
+        const scaledWidth = block.bbox.w * scale;
+        const finalScale = scaledWidth > availableWidth ? availableWidth / block.bbox.w : scale;
+        const offsetX = scaledWidth < availableWidth ? (availableWidth - scaledWidth) / 2 : 0;
+
+        const positionedItems = [];
+        for (const item of block.items) {
+          if (!item.str) continue;
+          const itemFM = fontMap?.get(item.fontName);
+          const itemBold = !!(itemFM?.bold || itemFM?.black);
+          const itemItalic = !!itemFM?.italic;
+          let itemFamily;
+          if (itemFM?.loadedName) {
+            itemFamily = `"${itemFM.loadedName}", ${itemFM.fallbackName || "sans-serif"}`;
+          } else if (itemFM?.css) {
+            itemFamily = itemFM.css;
+          } else {
+            itemFamily = fontFamily;
+          }
+          const itemPdfFS = Math.hypot(item.transform[2], item.transform[3]);
+
+          positionedItems.push({
+            text: item.str,
+            x: (item.transform[4] - block.bbox.x) * finalScale + offsetX,
+            y: (pageHeight - item.transform[5] - block.bbox.y) * finalScale,
+            fontSize: itemPdfFS * finalScale,
+            bold: itemBold,
+            italic: itemItalic,
+            fontFamily: itemFamily,
+            color: item._color || block.color || "#000000",
+          });
+        }
+
+        const blockHeight = block.bbox.h * finalScale;
+        reflowedRegions.push({
+          type: "positioned",
+          items: positionedItems,
+          height: blockHeight,
+          region,
+        });
+        continue;
+      }
+
       // Per-block font properties using real font metadata from commonObjs
       const blockFontSize = Math.round(fontSize * (block.fontScale || 1));
       const blockLH = blockFontSize * lineHeight;
@@ -1514,6 +1663,7 @@ function reflowAndComposite(analysis, opts) {
         align: block.align || "left",
         color: block.color,
         colorSpans: block.colorSpans || [],
+        styledSegments: block.styledSegments || null,
         region,
       });
     } else if (region.type === "divider") {
@@ -1700,6 +1850,7 @@ export function createReflowRenderer(container, options = {}) {
 
         const hasMultipleColors = r.colorSpans && r.colorSpans.length > 1 &&
           !r.colorSpans.every(s => s.color === r.colorSpans[0].color);
+        const hasStyledSegments = r.styledSegments && r.styledSegments.length > 1;
 
         if (!enableMorph) {
           ctx.fillStyle = r.color || textColor;
@@ -1750,6 +1901,14 @@ export function createReflowRenderer(container, options = {}) {
                 ctx.fillText(line.text, padding * d, screenY * d);
               }
               ctx.restore();
+            } else if (hasStyledSegments && !hasMultipleColors) {
+              // Per-segment bold/italic switching
+              drawStyledLine(ctx, line.text, lineCharOffset, r.styledSegments,
+                fs, rFamily, d, r.color || textColor,
+                centered ? ((W * d - ctx.measureText(line.text).width) / 2) : padding * d,
+                screenY * d);
+              // Restore base font after styled line
+              ctx.font = `${style} ${weight} ${fs * d}px ${rFamily}`;
             } else if (hasMultipleColors) {
               // Per-span coloring for inline colored text (links, emphasis)
               if (shouldJustify) {
@@ -1780,6 +1939,19 @@ export function createReflowRenderer(container, options = {}) {
           lineCharOffset += line.text.length;
           cursorY += lh;
         }
+      } else if (r.type === "positioned" && r.items) {
+        // Proportionally positioned structured block (author grids, etc.)
+        for (const item of r.items) {
+          const screenY = cursorY + item.y - scrollY;
+          if (screenY > -item.fontSize * 2 && screenY < H + item.fontSize * 2) {
+            const iWeight = item.bold ? 700 : 400;
+            const iStyle = item.italic ? "italic" : "normal";
+            ctx.font = `${iStyle} ${iWeight} ${item.fontSize * d}px ${item.fontFamily}`;
+            ctx.fillStyle = item.color || textColor;
+            ctx.fillText(item.text, (padding + item.x) * d, screenY * d);
+          }
+        }
+        cursorY += r.height;
       } else if (r.type === "divider") {
         // Draw horizontal divider line
         const screenY = cursorY - scrollY + 1; // Slight offset to center in area
