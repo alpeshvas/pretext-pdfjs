@@ -1575,17 +1575,25 @@ function reflowAndComposite(analysis, opts) {
     }
 
     // Collect consecutive narrow text blocks within a compact vertical range
-    // Stop at large vertical gaps (section breaks) or non-text regions
+    // Stop at large vertical gaps, section breaks, font changes, or page limits
     const run = [region];
     const startY = region.bbox.y;
     let mj = mi + 1;
     while (mj < regionMap.length) {
       const next = regionMap[mj];
       if (next.type !== "text") break;
-      // Large vertical gap = section break (e.g., before "Abstract")
+      // Stop if run is already large enough (author grids < 20 blocks)
+      if (run.length >= 20) break;
+      // Large vertical gap = section break
       const gap = next.gapAbsolute || 0;
       const avgFS = next.block.avgFontSize || 12;
-      if (gap > avgFS * 3) break;
+      if (gap > avgFS * 2) break;
+      // Stop if font size changes significantly (heading vs body)
+      const firstFS = run[0].block.avgFontSize || 12;
+      const nextFS = next.block.avgFontSize || 12;
+      if (Math.max(firstFS, nextFS) / Math.min(firstFS, nextFS) > 1.3) break;
+      // Stop if a block is bold and previous blocks aren't (section heading)
+      if (next.block.isBold && !run[run.length - 1].block.isBold && run.length >= 3) break;
       // Only include narrow blocks or wide blocks with high X-cluster count
       if (next.block.bbox.w > pageWidth * 0.5) {
         const nxPos = next.block.items.map(it => it.transform[4]).sort((a, b) => a - b);
@@ -1595,6 +1603,8 @@ function reflowAndComposite(analysis, opts) {
         }
         if (nxC < 3) break;
       }
+      // Stop if past the first half of the page (structured blocks are at the top)
+      if (next.bbox.y > pageHeight * 0.55) break;
       if (next.bbox.y + next.bbox.h - startY > pageHeight * 0.25) break;
       run.push(next);
       mj++;
@@ -1603,7 +1613,10 @@ function reflowAndComposite(analysis, opts) {
     if (run.length >= 3) {
       const combinedX = Math.min(...run.map(r => r.bbox.x));
       const combinedW = Math.max(...run.map(r => r.bbox.x + r.bbox.w)) - combinedX;
-      if (combinedW > pageWidth * 0.4) {
+      const combinedBottom = Math.max(...run.map(r => r.bbox.y + r.bbox.h));
+      const combinedH = combinedBottom - Math.min(...run.map(r => r.bbox.y));
+      // Only merge if in top half of page, height is reasonable, and width spans enough
+      if (combinedW > pageWidth * 0.4 && combinedH < pageHeight * 0.35 && combinedBottom < pageHeight * 0.6) {
         // Merge into a single block for structured positioning
         const allItems = [];
         for (const r of run) allItems.push(...r.block.items);
